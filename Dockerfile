@@ -1,28 +1,59 @@
-FROM python:3.11-slim
+FROM python:3.13-slim
 
 WORKDIR /app
 
-# System deps: ffmpeg for media processing + curl for healthcheck
-RUN apt-get update && \
+COPY pyproject.toml uv.lock docker-entrypoint.sh ./
+
+# Strip carriage-return (Windows) & set permissions
+# Install system dependencies
+RUN sed -i 's/\r$//g' docker-entrypoint.sh && \
+    chmod +x docker-entrypoint.sh && \
+    apt-get update && \
     apt-get install -y --no-install-recommends \
       ca-certificates \
       ffmpeg \
+      unzip \
+      aria2 \
+      coreutils \
+      gosu \
       curl \
-    && rm -rf /var/lib/apt/lists/*
-
-# Python dependencies
-COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
-
-# Application files
-COPY app/                 ./app/
-COPY ui/                  ./ui/
-COPY docker-entrypoint.sh ./
-
-RUN chmod +x docker-entrypoint.sh && \
+      tini \
+      build-essential && \
+    curl -LsSf https://astral.sh/uv/install.sh | UV_INSTALL_DIR=/usr/local/bin sh && \
+    UV_PROJECT_ENVIRONMENT=/usr/local uv sync --frozen --no-dev --compile-bytecode && \
+    uv cache clean && \
+    rm -f /usr/local/bin/uv /usr/local/bin/uvx /usr/local/bin/uvw && \
+    curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh -s -- -y && \
+    apt-get purge -y --auto-remove build-essential && \
+    rm -rf /var/lib/apt/lists/* && \
+    mkdir /.cache && chmod 777 /.cache && \
     mkdir -p /downloads /tmp/lunarmetube
 
-# ── Environment defaults ────────────────────────────────────────
+ARG TARGETARCH
+
+RUN BGUTIL_TAG="$(curl -Ls -o /dev/null -w '%{url_effective}' https://github.com/jim60105/bgutil-ytdlp-pot-provider-rs/releases/latest | sed 's#.*/tag/##')" && \
+    case "$TARGETARCH" in \
+      amd64) BGUTIL_ARCH="x86_64" ;; \
+      arm64) BGUTIL_ARCH="aarch64" ;; \
+      *) echo "Unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; \
+    esac && \
+    curl -L -o /usr/local/bin/bgutil-pot \
+      "https://github.com/jim60105/bgutil-ytdlp-pot-provider-rs/releases/download/${BGUTIL_TAG}/bgutil-pot-linux-${BGUTIL_ARCH}" && \
+    chmod +x /usr/local/bin/bgutil-pot && \
+    PLUGIN_DIR="$(python3 -c 'import site; print(site.getsitepackages()[0])')" && \
+    curl -L -o /tmp/bgutil-ytdlp-pot-provider-rs.zip \
+      "https://github.com/jim60105/bgutil-ytdlp-pot-provider-rs/releases/download/${BGUTIL_TAG}/bgutil-ytdlp-pot-provider-rs.zip" && \
+    unzip -q /tmp/bgutil-ytdlp-pot-provider-rs.zip -d "${PLUGIN_DIR}" && \
+    rm /tmp/bgutil-ytdlp-pot-provider-rs.zip
+
+COPY app/ ./app/
+COPY ui/  ./ui/
+
+# ── Environment defaults ─────────────────────────────────────────
+ENV PUID=1000
+ENV PGID=1000
+ENV UMASK=022
+
 ENV DOWNLOAD_DIR=/downloads \
     AUDIO_DOWNLOAD_DIR=/downloads \
     TEMP_DIR=/tmp/lunarmetube \
@@ -30,10 +61,15 @@ ENV DOWNLOAD_DIR=/downloads \
     PORT=8081 \
     HOST=0.0.0.0
 
-VOLUME ["/downloads"]
+# NOTE: VOLUME dihapus - Railway tidak mendukung VOLUME.
+# Gunakan Railway Volumes dari dashboard dan mount ke /downloads.
 EXPOSE 8081
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
   CMD curl -fsS "http://localhost:${PORT}/" || exit 1
 
-ENTRYPOINT ["./docker-entrypoint.sh"]
+# Add build-time argument for version
+ARG VERSION=dev
+ENV METUBE_VERSION=$VERSION
+
+ENTRYPOINT ["/usr/bin/tini", "-g", "--", "./docker-entrypoint.sh"]
