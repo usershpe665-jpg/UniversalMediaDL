@@ -373,6 +373,11 @@
       proxy:                $('proxyInput').value || null,
       rate_limit:           $('rateLimitInput').value || null,
       cookies_from_browser: $('cookiesInput').value || null,
+      // Container format (video only) — e.g. mp4, mkv, webm, avi, mov
+      container:            audioOnly ? '' : ($('containerSelect')?.value || 'mp4'),
+      // Playlist range (Advanced tab)
+      playlist_start:       $('playlistStart')?.value ? parseInt($('playlistStart').value) : null,
+      playlist_end:         $('playlistEnd')?.value   ? parseInt($('playlistEnd').value)   : null,
     };
   }
 
