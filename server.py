@@ -49,18 +49,9 @@ STATE_DIR.mkdir(parents=True, exist_ok=True)
 #      Isi variabelnya dengan konten cookies.txt mentah (format Netscape),
 #      persis seperti isi file cookies.txt, tanpa encoding apapun.
 #
-# Contoh isi YOUTUBE_COOKIES di Railway:
-#   # Netscape HTTP Cookie File
-#   .youtube.com	TRUE	/	TRUE	1999999999	VISITOR_INFO1_LIVE	xxxx
-#   .youtube.com	TRUE	/	TRUE	1999999999	YSC	xxxx
-#   ... dst
-#
 COOKIES_FILE = STATE_DIR / "cookies.txt"
 
 # ─── Proxy ────────────────────────────────────────────────────────────────────
-# Proxy DINONAKTIFKAN secara default (koneksi langsung ke YouTube).
-# Set env var PROXY_URL di Railway jika perlu proxy.
-# Contoh: PROXY_URL=socks5://host:1080
 DEFAULT_PROXY = os.environ.get("PROXY_URL", "").strip()
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
@@ -143,20 +134,12 @@ def cleanup_old_jobs(max_age_hours: int = 4):
         logger.info(f"Cleaned up {len(to_remove)} old jobs from memory")
 
 def _load_cookies_from_env():
-    """
-    Tulis isi env var YOUTUBE_COOKIES ke file cookies.txt secara langsung.
-    Env var berisi konten cookies.txt mentah (format Netscape), tanpa encoding.
-    Hanya dijalankan jika belum ada cookies yang di-upload via UI.
-    """
     raw = os.environ.get("YOUTUBE_COOKIES", "").strip()
     if not raw:
         return
-
-    # Jika sudah ada cookies yang di-upload via UI, jangan timpa
     if COOKIES_FILE.exists() and COOKIES_FILE.stat().st_size > 0:
         logger.debug("Cookies file already exists (uploaded via UI), skipping env var load")
         return
-
     try:
         content = raw.encode("utf-8")
         tmp_path = Path(str(COOKIES_FILE) + ".tmp")
@@ -168,17 +151,10 @@ def _load_cookies_from_env():
         logger.warning(f"Failed to write cookies from YOUTUBE_COOKIES env var: {e}")
 
 def _auto_load_cookies():
-    """
-    Auto-detect dan aktifkan cookies saat startup.
-    Urutan prioritas: file yang sudah ada → env var YOUTUBE_COOKIES.
-    """
-    # Prioritas 1: file yang sudah di-upload via UI sebelumnya
     if COOKIES_FILE.exists() and COOKIES_FILE.stat().st_size > 0:
         set_runtime_override("cookiefile", str(COOKIES_FILE))
         logger.info(f"Cookie file detected at {COOKIES_FILE}")
         return
-
-    # Prioritas 2: env var YOUTUBE_COOKIES
     _load_cookies_from_env()
 
 def get_cookies_args() -> list:
@@ -189,11 +165,6 @@ def get_cookies_args() -> list:
     return []
 
 def get_proxy_args(user_proxy: str = None) -> list:
-    """
-    Kembalikan argumen proxy untuk yt-dlp.
-    Prioritas: proxy dari user (frontend) → env var PROXY_URL.
-    Jika keduanya kosong, tidak pakai proxy (koneksi langsung).
-    """
     proxy = (user_proxy or "").strip() or DEFAULT_PROXY
     if proxy:
         logger.info(f"🌐 Using proxy: {proxy}")
@@ -222,9 +193,7 @@ def _find_latest_file(hint_name: str = None) -> Path | None:
     return files[0] if files else None
 
 def _extract_error_message(output: str) -> str:
-    """
-    Ekstrak pesan error yang paling relevan dari output yt-dlp.
-    """
+    """Ekstrak pesan error yang paling relevan dari output yt-dlp."""
     if not output:
         return "Unknown error"
     lines = [l.strip() for l in output.strip().splitlines() if l.strip()]
@@ -233,6 +202,40 @@ def _extract_error_message(output: str) -> str:
             line = re.sub(r'^(ERROR|WARNING):\s*', '', line)
             return line
     return lines[-1] if lines else "Unknown error"
+
+def _format_bytes(n) -> str:
+    """Format bytes ke string yang mudah dibaca (seperti metube)."""
+    try:
+        n = float(n)
+    except (TypeError, ValueError):
+        return "?"
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if abs(n) < 1024.0:
+            return f"{n:.1f}{unit}"
+        n /= 1024.0
+    return f"{n:.1f}PiB"
+
+def _format_speed(bps) -> str:
+    """Format kecepatan download (bytes/s) ke string yang akurat."""
+    try:
+        bps = float(bps)
+    except (TypeError, ValueError):
+        return None
+    return f"{_format_bytes(bps)}/s"
+
+def _format_eta(seconds) -> str:
+    """Format ETA (seconds) ke string yang akurat."""
+    try:
+        secs = int(seconds)
+    except (TypeError, ValueError):
+        return None
+    if secs < 0:
+        return None
+    hours, rem = divmod(secs, 3600)
+    mins, secs2 = divmod(rem, 60)
+    if hours:
+        return f"{hours:02d}:{mins:02d}:{secs2:02d}"
+    return f"{mins:02d}:{secs2:02d}"
 
 # ─── Static Routes ────────────────────────────────────────────────────────────
 
@@ -288,7 +291,7 @@ def health_check():
 
     return jsonify({
         "status":         "online",
-        "server":         "LunarMediaDL v2.1.0",
+        "server":         "LunarMediaDL v2.2.0",
         "ytdlp_version":  ytdlp_version,
         "timestamp":      datetime.utcnow().isoformat(),
         "cookies_loaded": cookies_ok,
@@ -301,11 +304,6 @@ def health_check():
 
 @app.route("/api/cookies/upload", methods=["POST"])
 def upload_cookies():
-    """
-    Upload cookies.txt langsung via multipart form-data atau raw body.
-    Field name: 'cookies' (multipart) atau raw body.
-    File yang di-upload via UI akan menimpa cookies dari env var.
-    """
     MAX_SIZE = 1_000_000  # 1MB
 
     content = None
@@ -322,7 +320,6 @@ def upload_cookies():
     if len(content) > MAX_SIZE:
         return jsonify({"status": "error", "msg": "Cookie file too large (max 1MB)"}), 400
 
-    # Validasi: harus ada minimal satu baris non-komentar
     try:
         text = content.decode("utf-8", errors="replace")
         if not any(line.strip() and not line.startswith("#") for line in text.splitlines()):
@@ -330,7 +327,6 @@ def upload_cookies():
     except Exception:
         pass
 
-    # Tulis atomik
     tmp_path = Path(str(COOKIES_FILE) + ".tmp")
     try:
         tmp_path.write_bytes(content)
@@ -344,10 +340,6 @@ def upload_cookies():
 
 @app.route("/api/cookies/delete", methods=["DELETE", "POST"])
 def delete_cookies():
-    """
-    Hapus cookies yang di-upload via UI.
-    Jika ada env var YOUTUBE_COOKIES, cookies akan di-reload dari sana.
-    """
     has_uploaded = COOKIES_FILE.exists()
     has_env_var  = bool(os.environ.get("YOUTUBE_COOKIES", "").strip())
 
@@ -362,7 +354,6 @@ def delete_cookies():
     try:
         COOKIES_FILE.unlink()
         remove_runtime_override("cookiefile")
-        # Jika ada env var, reload dari sana sebagai fallback
         if has_env_var:
             _load_cookies_from_env()
             return jsonify({"status": "ok", "msg": "Cookies file dihapus. Cookies dari env var YOUTUBE_COOKIES diaktifkan kembali."})
@@ -374,7 +365,6 @@ def delete_cookies():
 
 @app.route("/api/cookies/status", methods=["GET"])
 def cookies_status():
-    """Cek apakah cookies tersedia dan aktif."""
     cookiefile  = get_runtime_override("cookiefile")
     has_cookies = bool(cookiefile and Path(cookiefile).exists() and Path(cookiefile).stat().st_size > 0)
     has_env_var = bool(os.environ.get("YOUTUBE_COOKIES", "").strip())
@@ -415,8 +405,8 @@ def fetch_info():
         url, "--dump-json",
         "--no-playlist" if not data.get("playlist") else "--yes-playlist",
         "--no-warnings",
-        "--no-check-formats",        # jangan verifikasi ketersediaan format (cegah error "format not available")
-        "--ignore-no-formats-error", # jangan gagal jika daftar format kosong
+        "--no-check-formats",
+        "--ignore-no-formats-error",
         "--socket-timeout", "30", "--retries", "3",
         "--extractor-retries", "3",
     ] + get_cookies_args() + get_proxy_args(user_proxy)
@@ -565,26 +555,153 @@ def start_download():
     logger.info(f"Download job {job_id[:8]} started for {url}")
     return jsonify({"job_id": job_id})
 
+
+# ─── Progress template untuk parsing akurat (seperti metube) ─────────────────
+# Template ini menghasilkan baris YTDLP_PROGRESS|...| yang mudah di-parse
+_PROGRESS_TMPL = (
+    "download:YTDLP_PROGRESS"
+    "|%(progress.downloaded_bytes)s"
+    "|%(progress.total_bytes)s"
+    "|%(progress.total_bytes_estimate)s"
+    "|%(progress.speed)s"
+    "|%(progress.eta)s"
+    "|%(progress._percent_str)s"
+)
+
+
+def _parse_progress_line(line: str) -> dict | None:
+    """
+    Parse baris YTDLP_PROGRESS dari yt-dlp progress-template.
+    Mengembalikan dict dengan key: progress, filesize, speed, eta
+    atau None jika bukan baris progress.
+    """
+    if not line.startswith("YTDLP_PROGRESS|"):
+        return None
+
+    parts = line.split("|")
+    # parts[0] = "YTDLP_PROGRESS"
+    # parts[1] = downloaded_bytes
+    # parts[2] = total_bytes
+    # parts[3] = total_bytes_estimate
+    # parts[4] = speed (bytes/s)
+    # parts[5] = eta (seconds)
+    # parts[6] = percent string (e.g. " 42.3%")
+
+    def safe_float(val):
+        try:
+            v = float(val)
+            return v if v > 0 else None
+        except (TypeError, ValueError):
+            return None
+
+    downloaded = safe_float(parts[1] if len(parts) > 1 else None)
+    total      = safe_float(parts[2] if len(parts) > 2 else None) or \
+                 safe_float(parts[3] if len(parts) > 3 else None)
+    speed_bps  = safe_float(parts[4] if len(parts) > 4 else None)
+    eta_secs   = safe_float(parts[5] if len(parts) > 5 else None)
+    pct_str    = parts[6].strip() if len(parts) > 6 else ""
+
+    # Hitung persen dari downloaded/total (akurat), fallback ke pct_str
+    pct = None
+    if downloaded is not None and total and total > 0:
+        pct = min(downloaded / total * 100, 100.0)
+    elif pct_str:
+        m = re.search(r"([\d.]+)%", pct_str)
+        if m:
+            pct = float(m.group(1))
+
+    return {
+        "progress": pct,
+        "filesize":  _format_bytes(total) if total else None,
+        "speed":     _format_speed(speed_bps),
+        "eta":       _format_eta(eta_secs),
+    }
+
+
+def _build_format_selector(audio_only: bool, audio_format: str,
+                            audio_quality: str, format_id: str,
+                            quality: str) -> list:
+    """
+    Bangun argumen -f / -x yang tepat untuk yt-dlp.
+    Referensi: metube dl_formats.py get_format()
+    """
+    # ── Audio only ────────────────────────────────────────────────────────────
+    if audio_only:
+        # Pilih stream audio terbaik, lalu konversi ke format yang diminta.
+        # Mirip metube: bestaudio/best agar tidak gagal "format not available".
+        # -x = extract audio; --audio-format = target codec via ffmpeg.
+        # audio_quality: 0=best VBR (default), 2=high, 5=medium, 9=low
+        # Untuk FLAC/WAV (lossless), --audio-quality tidak berpengaruh.
+        _aq = audio_quality if audio_quality in ("0", "2", "5", "9") else "0"
+        return [
+            "-f", "bestaudio/best",
+            "-x",
+            "--audio-format", (audio_format or "mp3").lower(),
+            "--audio-quality", _aq,
+        ]
+
+    # ── Format_id eksplisit dari daftar format ────────────────────────────────
+    if format_id:
+        # Fallback chain: format+audio → format+apapun → format saja → best
+        # Matching metube: bestvideo+bestaudio/best pattern
+        return [
+            "-f",
+            f"{format_id}+bestaudio[ext=m4a]"
+            f"/{format_id}+bestaudio"
+            f"/{format_id}"
+            f"/bestvideo+bestaudio/best",
+        ]
+
+    # ── Quality preset (resolusi) ─────────────────────────────────────────────
+    if quality and quality not in ("best", "bestvideo+bestaudio", "bestvideo+bestaudio/best", ""):
+        # quality berupa height, misalnya "720", "1080"
+        # Coba dua kolom: mp4 stream dulu, lalu any
+        vres = f"[height<={quality}]"
+        return [
+            "-f",
+            f"bestvideo{vres}[ext=mp4]+bestaudio[ext=m4a]"
+            f"/bestvideo{vres}+bestaudio"
+            f"/best{vres}"
+            f"/bestvideo+bestaudio/best",
+        ]
+
+    # ── Default: kualitas terbaik ─────────────────────────────────────────────
+    return ["-f", "bestvideo+bestaudio/best"]
+
+
 def _download_worker(job_id: str, url: str, opts: dict):
     """Background thread: runs yt-dlp and updates job state."""
     cleanup_old_files()
     cleanup_old_jobs()
 
-    audio_only    = opts.get("audio_only", False)
-    audio_format  = opts.get("audio_format", "mp3")
-    format_id     = opts.get("format_id", "")
-    quality       = opts.get("quality", "bestvideo+bestaudio")
-    subtitles     = opts.get("subtitles", False)
-    subtitle_lang = opts.get("subtitle_lang", "en")
-    auto_subs     = opts.get("auto_subtitles", False)
-    playlist      = opts.get("playlist", False)
-    embed_thumb   = opts.get("embed_thumbnail", False)
-    embed_meta    = opts.get("embed_metadata", True)
-    write_subs    = opts.get("write_subtitles", False)
-    sub_format    = opts.get("subtitle_format", "srt")
-    cookies_from  = (opts.get("cookies_from_browser") or "").strip()
-    rate_limit    = opts.get("rate_limit")
-    user_proxy    = (opts.get("proxy") or "").strip()
+    audio_only     = opts.get("audio_only", False)
+    audio_format   = (opts.get("audio_format") or "mp3").lower()
+    # audio_quality: 0=best VBR, 2=high, 5=medium, 9=low (untuk lossy MP3/AAC/OGG/Opus)
+    # Untuk FLAC/WAV (lossless) nilai ini diabaikan yt-dlp (sudah lossless)
+    audio_quality  = str(opts.get("audio_quality") or "0").strip()
+    if audio_quality not in ("0", "2", "5", "9"):
+        audio_quality = "0"
+    format_id      = (opts.get("format_id") or "").strip()
+    quality        = (opts.get("quality") or "").strip()
+    # Container format untuk video: mp4/mkv/webm/avi/mov. Default mp4.
+    _VALID_CONTAINERS = {"mp4", "mkv", "webm", "avi", "mov"}
+    container      = (opts.get("container") or "mp4").lower().strip()
+    if container not in _VALID_CONTAINERS:
+        container = "mp4"
+    subtitles      = opts.get("subtitles", False)
+    subtitle_lang  = opts.get("subtitle_lang", "en")
+    auto_subs      = opts.get("auto_subtitles", False)
+    playlist       = opts.get("playlist", False)
+    playlist_start = opts.get("playlist_start")  # None = dari awal
+    playlist_end   = opts.get("playlist_end")    # None = sampai akhir
+    embed_thumb    = opts.get("embed_thumbnail", False)
+    embed_meta     = opts.get("embed_metadata", True)
+    write_subs     = opts.get("write_subtitles", False)
+    sub_format     = opts.get("subtitle_format", "srt")
+    cookies_from   = (opts.get("cookies_from_browser") or "").strip()
+    rate_limit     = opts.get("rate_limit")
+    user_proxy     = (opts.get("proxy") or "").strip()
+    embed_chapters = opts.get("embed_chapters", False)
 
     output_template = str(DOWNLOAD_DIR / "%(title)s.%(ext)s")
 
@@ -597,18 +714,12 @@ def _download_worker(job_id: str, url: str, opts: dict):
         "--fragment-retries", "5",
         "--extractor-retries", "3",
         "--newline",
-        "--progress",
+        # Gunakan progress-template untuk data numerik yang akurat (seperti metube)
+        "--progress-template", _PROGRESS_TMPL,
     ]
 
-    # ── Format selection ──────────────────────────────────────────────────────
-    if audio_only:
-        args += ["-x", "--audio-format", audio_format, "--audio-quality", "0"]
-    elif format_id:
-        args += ["-f", f"{format_id}+bestaudio[ext=m4a]/{format_id}+bestaudio/{format_id}/bestvideo+bestaudio/best"]
-    elif quality and quality not in ("best", "bestvideo+bestaudio", ""):
-        args += ["-f", f"{quality}+bestaudio[ext=m4a]/{quality}+bestaudio/{quality}/bestvideo+bestaudio/best"]
-    else:
-        args += ["-f", "bestvideo+bestaudio/best"]
+    # ── Format selection (diperbaiki) ─────────────────────────────────────────
+    args += _build_format_selector(audio_only, audio_format, audio_quality, format_id, quality)
 
     # ── Playlist ──────────────────────────────────────────────────────────────
     if not playlist:
@@ -619,6 +730,17 @@ def _download_worker(job_id: str, url: str, opts: dict):
             "--output",
             str(DOWNLOAD_DIR / "%(playlist_title)s/%(playlist_index)s - %(title)s.%(ext)s"),
         ]
+        # Playlist range: --playlist-start / --playlist-end
+        try:
+            if playlist_start and int(playlist_start) > 1:
+                args += ["--playlist-start", str(int(playlist_start))]
+        except (TypeError, ValueError):
+            pass
+        try:
+            if playlist_end and int(playlist_end) > 0:
+                args += ["--playlist-end", str(int(playlist_end))]
+        except (TypeError, ValueError):
+            pass
 
     # ── Subtitles ─────────────────────────────────────────────────────────────
     if subtitles:
@@ -633,6 +755,8 @@ def _download_worker(job_id: str, url: str, opts: dict):
         args.append("--embed-thumbnail")
     if embed_meta:
         args.append("--embed-metadata")
+    if embed_chapters and not audio_only:
+        args.append("--embed-chapters")
 
     # ── Network & Cookies ─────────────────────────────────────────────────────
     if rate_limit:
@@ -643,12 +767,15 @@ def _download_worker(job_id: str, url: str, opts: dict):
     args += get_proxy_args(user_proxy)
     args += get_cookies_args()
 
-    # ── Post-processing ───────────────────────────────────────────────────────
+    # ── Post-processing (video) ───────────────────────────────────────────────
     if not audio_only:
-        args += ["--merge-output-format", "mp4", "--add-metadata"]
+        # Gunakan container yang dipilih user (mp4/mkv/webm/avi/mov)
+        args += ["--merge-output-format", container, "--add-metadata"]
 
     with jobs_lock:
         jobs[job_id]["status"] = "downloading"
+
+    logger.info(f"Job {job_id[:8]} yt-dlp args: {' '.join(args)}")
 
     # ── Run yt-dlp ────────────────────────────────────────────────────────────
     try:
@@ -663,29 +790,47 @@ def _download_worker(job_id: str, url: str, opts: dict):
         output_filename = None
         error_lines     = []
 
-        for line in proc.stdout:
-            line = line.strip()
+        for raw_line in proc.stdout:
+            line = raw_line.strip()
             if not line:
                 continue
 
-            # Kumpulkan baris error untuk pesan error yang lebih informatif
+            # Kumpulkan baris error
             if any(pfx in line for pfx in ("ERROR:", "WARNING:", "Error:")):
                 error_lines.append(line)
 
-            # Parse progress
+            # ── Parse progress dari template (akurat, seperti metube) ──────
+            progress_data = _parse_progress_line(line)
+            if progress_data:
+                with jobs_lock:
+                    if progress_data["progress"] is not None:
+                        jobs[job_id]["progress"] = progress_data["progress"]
+                    if progress_data["filesize"]:
+                        jobs[job_id]["filesize"] = progress_data["filesize"]
+                    if progress_data["speed"]:
+                        jobs[job_id]["speed"]    = progress_data["speed"]
+                    if progress_data["eta"]:
+                        jobs[job_id]["eta"]      = progress_data["eta"]
+                continue  # Baris progress sudah di-handle
+
+            # ── Fallback: parse progress dari format lama yt-dlp ──────────
+            # (untuk kompatibilitas jika --progress-template tidak support)
             if "[download]" in line and "%" in line:
                 m = re.search(
-                    r"(\d+\.?\d*)%(?:.*?of\s+([\d.]+\s*\S+))?(?:.*?at\s+([\d.]+\s*\S+/s))?(?:.*?ETA\s+(\S+))?",
+                    r"([\d.]+)%"
+                    r"(?:\s+of\s+~?\s*([\d.]+\s*\S+))?"
+                    r"(?:\s+at\s+([\d.]+\s*\S+/s))?"
+                    r"(?:\s+ETA\s+(\S+))?",
                     line,
                 )
                 if m:
                     with jobs_lock:
                         jobs[job_id]["progress"] = float(m.group(1))
-                        if m.group(2): jobs[job_id]["filesize"] = m.group(2)
-                        if m.group(3): jobs[job_id]["speed"]    = m.group(3)
-                        if m.group(4): jobs[job_id]["eta"]      = m.group(4)
+                        if m.group(2): jobs[job_id]["filesize"] = m.group(2).strip()
+                        if m.group(3): jobs[job_id]["speed"]    = m.group(3).strip()
+                        if m.group(4): jobs[job_id]["eta"]      = m.group(4).strip()
 
-            # Deteksi nama file output dari berbagai format yt-dlp
+            # ── Deteksi nama file output ───────────────────────────────────
             if "Destination:" in line:
                 output_filename = line.split("Destination:")[-1].strip()
 
