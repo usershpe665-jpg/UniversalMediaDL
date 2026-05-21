@@ -1,0 +1,6 @@
+aiohttp
+python-socketio>=5.0,<6.0
+yt-dlp[default,curl-cffi]
+mutagen
+curl-cffi
+watchfiles
