@@ -176,7 +176,12 @@ def run_ytdlp(args: list) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, capture_output=True, text=True, timeout=300)
 
 def _find_latest_file(hint_name: str = None) -> Path | None:
-    """Find the most recently modified file in DOWNLOAD_DIR."""
+    """Cari file media terbaru di DOWNLOAD_DIR.
+    File gambar (.jpg/.png/.webp) diabaikan kecuali tidak ada file lain,
+    agar thumbnail sementara tidak dikembalikan sebagai hasil download.
+    """
+    _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".jfif"}
+
     if hint_name:
         hint_path = Path(hint_name)
         if hint_path.exists() and hint_path.is_file():
@@ -185,12 +190,16 @@ def _find_latest_file(hint_name: str = None) -> Path | None:
         if candidate.exists() and candidate.is_file():
             return candidate
 
-    files = sorted(
+    all_files = sorted(
         [f for f in DOWNLOAD_DIR.glob("*.*") if f.is_file()],
         key=lambda f: f.stat().st_mtime,
         reverse=True,
     )
-    return files[0] if files else None
+    # Prioritaskan file audio/video, bukan thumbnail gambar
+    media_files = [f for f in all_files if f.suffix.lower() not in _IMAGE_EXTS]
+    if media_files:
+        return media_files[0]
+    return all_files[0] if all_files else None
 
 def _extract_error_message(output: str) -> str:
     """Ekstrak pesan error yang paling relevan dari output yt-dlp."""
@@ -760,10 +769,12 @@ def _download_worker(job_id: str, url: str, opts: dict):
     # ── Metadata / Thumbnail ──────────────────────────────────────────────────
     if embed_thumb:
         if audio_only:
-            # Referensi metube: FFmpegThumbnailsConvertor(format="jpg", when="before_dl")
-            # lalu EmbedThumbnail. Tanpa konversi ke JPG dulu, embed bisa gagal
-            # untuk format thumbnail non-JPEG (webp dll) yang umum di YouTube.
-            args += ["--write-thumbnail", "--convert-thumbnails", "jpg", "--embed-thumbnail"]
+            # Referensi metube: FFmpegThumbnailsConvertor(format="jpg") + EmbedThumbnail.
+            # JANGAN pakai --write-thumbnail eksplisit — itu menyebabkan yt-dlp mencatat
+            # "[download] Destination: title.jpg" yang menimpa output_filename audio.
+            # --embed-thumbnail sudah handle thumbnail download+convert+embed secara
+            # internal tanpa mengubah Destination tracking ke file gambar.
+            args += ["--convert-thumbnails", "jpg", "--embed-thumbnail"]
         else:
             args.append("--embed-thumbnail")
     if embed_meta:
@@ -844,8 +855,14 @@ def _download_worker(job_id: str, url: str, opts: dict):
                         if m.group(4): jobs[job_id]["eta"]      = m.group(4).strip()
 
             # ── Deteksi nama file output ───────────────────────────────────
+            # PENTING: jangan simpan file thumbnail (.jpg/.png/.webp) sebagai
+            # output utama — itu hanya file sementara yang di-embed lalu dihapus.
+            _IMAGE_EXTS = ('.jpg', '.jpeg', '.png', '.webp', '.jfif')
+
             if "Destination:" in line:
-                output_filename = line.split("Destination:")[-1].strip()
+                dest = line.split("Destination:")[-1].strip()
+                if not dest.lower().endswith(_IMAGE_EXTS):
+                    output_filename = dest
 
             if "[Merger]" in line and "Merging formats into" in line:
                 m = re.search(r'Merging formats into ["\'](.+?)["\']', line)
@@ -858,7 +875,9 @@ def _download_worker(job_id: str, url: str, opts: dict):
             if "has already been downloaded" in line:
                 m = re.search(r"\[download\]\s+(.+?)\s+has already been downloaded", line)
                 if m:
-                    output_filename = m.group(1).strip()
+                    candidate_name = m.group(1).strip()
+                    if not candidate_name.lower().endswith(_IMAGE_EXTS):
+                        output_filename = candidate_name
 
             logger.debug(f"yt-dlp [{job_id[:8]}]: {line}")
 
