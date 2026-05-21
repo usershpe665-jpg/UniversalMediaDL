@@ -414,7 +414,10 @@ def fetch_info():
     args = [
         url, "--dump-json",
         "--no-playlist" if not data.get("playlist") else "--yes-playlist",
-        "--no-warnings", "--socket-timeout", "30", "--retries", "3",
+        "--no-warnings",
+        "--no-check-formats",        # jangan verifikasi ketersediaan format (cegah error "format not available")
+        "--ignore-no-formats-error", # jangan gagal jika daftar format kosong
+        "--socket-timeout", "30", "--retries", "3",
         "--extractor-retries", "3",
     ] + get_cookies_args() + get_proxy_args(user_proxy)
 
