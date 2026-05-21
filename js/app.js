@@ -1,8 +1,8 @@
 /**
- * LunarYtdl — Main Application
- * Orchestrates UI, API calls, and download flow
- * Author: Syawaliuz Octavian
- * v2.0 — Enhanced: dynamic download btn, bug fixes, history system
+ * LunarMediaDL — YouTube Downloader App
+ * Engine: metube yt-dlp Python API | UI: UniversalMediaDL space theme
+ * Proxy: removed | Cookies: via server env var YOUTUBE_COOKIES
+ * Author: Syawaliuz Octavian (UI) + Merged engine
  */
 
 (function App() {
@@ -21,7 +21,6 @@
   const playlistToggle  = $('playlistToggle');
   const urlValidation   = $('urlValidation');
 
-  // Video meta
   const videoThumb     = $('videoThumb');
   const videoDuration  = $('videoDuration');
   const videoTypeBadge = $('videoTypeBadge');
@@ -31,22 +30,19 @@
   const videoDate      = $('videoDate');
   const videoDesc      = $('videoDesc');
 
-  // Format options
-  const qualityGroupUHD = $('qualityGroupUHD');
-  const qualityGroupHD  = $('qualityGroupHD');
-  const qualityGroupSD  = $('qualityGroupSD');
-  const qualitySelect   = $('qualitySelect');
-  const formatList      = $('formatList');
+  const qualityGroupUHD  = $('qualityGroupUHD');
+  const qualityGroupHD   = $('qualityGroupHD');
+  const qualityGroupSD   = $('qualityGroupSD');
+  const qualitySelect    = $('qualitySelect');
+  const formatList       = $('formatList');
 
-  // Buttons
-  const backBtn         = $('backBtn');
-  const downloadBtn     = $('downloadBtn');       // single unified button
-  const downloadBtnLabel = $('downloadBtnLabel'); // label span inside button
-  const newDownloadBtn  = $('newDownloadBtn');
-  const cancelBtn       = $('cancelBtn');
-  const downloadFileBtn = $('downloadFileBtn');
+  const backBtn          = $('backBtn');
+  const downloadBtn      = $('downloadBtn');
+  const downloadBtnLabel = $('downloadBtnLabel');
+  const newDownloadBtn   = $('newDownloadBtn');
+  const cancelBtn        = $('cancelBtn');
+  const downloadFileBtn  = $('downloadFileBtn');
 
-  // Progress
   const progressTitle    = $('progressTitle');
   const progressFilename = $('progressFilename');
   const progressBarFill  = $('progressBarFill');
@@ -56,7 +52,6 @@
   const progressSize     = $('progressSize');
   const progressRing     = $('progressRing');
 
-  // History
   const historyToggleBtn = $('historyToggleBtn');
   const historyPanel     = $('historyPanel');
   const historyBackdrop  = $('historyBackdrop');
@@ -66,26 +61,23 @@
   const clearHistoryBtn  = $('clearHistoryBtn');
 
   // ════════════════════════════════════════════════════════
-  //  State: Track active tab for dynamic download button
+  //  Tab State → Dynamic Download Button
   // ════════════════════════════════════════════════════════
-  let activeTab = 'video'; // 'video' | 'audio' | 'advanced'
+  let activeTab = 'video';
 
   function updateDownloadButton() {
     if (!downloadBtn || !downloadBtnLabel) return;
-
     const isAudio = activeTab === 'audio';
     downloadBtn.dataset.mode = isAudio ? 'audio' : 'video';
 
     const iconVideo = downloadBtn.querySelector('.download-btn__icon--video');
     const iconAudio = downloadBtn.querySelector('.download-btn__icon--audio');
-
     if (iconVideo) iconVideo.style.display = isAudio ? 'none' : '';
     if (iconAudio) iconAudio.style.display = isAudio ? '' : 'none';
 
     downloadBtnLabel.textContent = isAudio ? 'Download Audio' : 'Download Video';
   }
 
-  // Intercept tab clicks to update active tab state
   document.querySelectorAll('.tab').forEach(tab => {
     tab.addEventListener('click', () => {
       activeTab = tab.dataset.tab || 'video';
@@ -94,9 +86,9 @@
   });
 
   // ════════════════════════════════════════════════════════
-  //  SVG progress ring math
+  //  Progress Ring
   // ════════════════════════════════════════════════════════
-  const RING_R = 28;
+  const RING_R    = 28;
   const RING_CIRC = 2 * Math.PI * RING_R;
 
   function injectProgressGradient() {
@@ -112,6 +104,10 @@
     `;
     svg.prepend(defs);
     if (progressRing) progressRing.setAttribute('stroke', 'url(#progressGradient)');
+    if (progressRing) {
+      progressRing.style.strokeDasharray  = RING_CIRC;
+      progressRing.style.strokeDashoffset = RING_CIRC;
+    }
   }
 
   function setRingProgress(pct) {
@@ -147,7 +143,6 @@
       clearBtn.classList.add('hidden');
       return;
     }
-
     clearBtn.classList.remove('hidden');
 
     if (isValidYouTubeUrl(url)) {
@@ -159,7 +154,7 @@
       urlInputWrapper.className = 'url-input-wrapper invalid';
       fetchBtn.disabled = true;
     } else {
-      setValidation('✗ Only YouTube URLs are supported', 'error');
+      setValidation('✗ Only YouTube URLs are supported on this page', 'error');
       urlInputWrapper.className = 'url-input-wrapper invalid';
       fetchBtn.disabled = true;
     }
@@ -175,6 +170,7 @@
   // ════════════════════════════════════════════════════════
   urlInput.addEventListener('input', () => validateUrl(urlInput.value));
   urlInput.addEventListener('paste', () => setTimeout(() => validateUrl(urlInput.value), 0));
+  urlInput.addEventListener('keydown', e => { if (e.key === 'Enter' && !fetchBtn.disabled) fetchBtn.click(); });
 
   pasteBtn.addEventListener('click', async () => {
     const text = await UI.pasteFromClipboard();
@@ -194,404 +190,306 @@
     urlInput.focus();
   });
 
-  urlInput.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter' && !fetchBtn.disabled) fetchBtn.click();
-  });
-
   // ════════════════════════════════════════════════════════
   //  Fetch Info
   // ════════════════════════════════════════════════════════
   fetchBtn.addEventListener('click', async () => {
-    const url = urlInput.value.trim();
-    if (!url || !isValidYouTubeUrl(url)) return;
+    const url     = urlInput.value.trim();
+    const playlist = playlistToggle?.checked || false;
+    if (!isValidYouTubeUrl(url)) return;
 
-    fetchBtn.classList.add('loading');
-    fetchBtn.setAttribute('aria-busy', 'true');
     fetchBtn.disabled = true;
-    setValidation('Fetching video information…', 'neutral');
+    fetchBtn.setAttribute('aria-busy', 'true');
+    fetchBtn.classList.add('loading');
 
     try {
-      const meta = await Downloader.fetchInfo(url, playlistToggle.checked);
-      renderVideoMeta(meta);
-      renderFormats(meta.formats || []);
-      // Reset to video tab on new fetch
-      activeTab = 'video';
-      updateDownloadButton();
+      const meta = await Downloader.fetchInfo(url, playlist);
+
+      // Populate video card
+      videoTitle.textContent   = meta.title    || 'Unknown';
+      videoChannel.textContent = meta.uploader || 'Unknown';
+      videoDesc.textContent    = meta.description || '';
+
+      if (meta.thumbnail) {
+        videoThumb.src = meta.thumbnail;
+        videoThumb.style.display = '';
+      }
+      if (meta.duration_string) videoDuration.textContent = meta.duration_string;
+
+      // Views & date
+      if (meta.view_count) {
+        videoViews.textContent = `${(meta.view_count / 1000).toFixed(0)}K views`;
+      }
+      if (meta.upload_date && meta.upload_date.length === 8) {
+        const y = meta.upload_date.slice(0,4);
+        const m = meta.upload_date.slice(4,6);
+        const d = meta.upload_date.slice(6,8);
+        videoDate.textContent = new Date(`${y}-${m}-${d}`).toLocaleDateString();
+      }
+
+      // Badge
+      if (meta.is_playlist) {
+        videoTypeBadge.textContent = `Playlist · ${meta.playlist_count || '?'} items`;
+      } else {
+        videoTypeBadge.textContent = 'Video';
+      }
+
+      // Populate format list (metube-style)
+      populateFormats(meta.formats || []);
+
+      // Populate quality select
+      populateQualitySelect(meta.formats || []);
+
       UI.showStep('stepInfo');
     } catch (err) {
-      const msg = err instanceof Downloader.APIError
-        ? err.message
-        : 'Could not connect to server. Is the backend running?';
-      UI.toast(msg, 'error', 5000);
-      setValidation(msg, 'error');
+      UI.toast(err.message || 'Failed to fetch media info.', 'error');
     } finally {
-      fetchBtn.classList.remove('loading');
-      fetchBtn.setAttribute('aria-busy', 'false');
       fetchBtn.disabled = false;
+      fetchBtn.setAttribute('aria-busy', 'false');
+      fetchBtn.classList.remove('loading');
     }
   });
 
-  // ════════════════════════════════════════════════════════
-  //  Render Video Metadata
-  // ════════════════════════════════════════════════════════
-  function renderVideoMeta(meta) {
-    videoTitle.textContent   = meta.title    || 'Unknown Title';
-    videoChannel.textContent = meta.uploader || 'Unknown Channel';
-    videoViews.textContent   = meta.view_count ? UI.formatNumber(meta.view_count) + ' views' : '—';
-    videoDate.textContent    = UI.formatDate(meta.upload_date);
-    videoDesc.textContent    = meta.description || '';
+  // ── Format List ────────────────────────────────────────────────────────────
+  function populateFormats(formats) {
+    formatList.innerHTML = '';
+    let selectedItem = null;
 
-    if (meta.thumbnail) {
-      videoThumb.src = meta.thumbnail;
-      videoThumb.alt = meta.title || 'Thumbnail';
+    const videoFmts = formats.filter(f => f.category === 'video');
+    const audioFmts = formats.filter(f => f.category === 'audio');
+
+    const addGroup = (label, items) => {
+      if (!items.length) return;
+      const hdr = document.createElement('div');
+      hdr.className = 'format-group-header';
+      hdr.textContent = label;
+      formatList.appendChild(hdr);
+
+      items.forEach(f => {
+        const item = document.createElement('div');
+        item.className = 'format-item';
+        item.setAttribute('role', 'option');
+        item.dataset.formatId = f.format_id;
+
+        const size = f.filesize
+          ? ` · ${(f.filesize / 1_048_576).toFixed(1)} MB`
+          : f.tbr ? ` · ~${Math.round(f.tbr)}kbps` : '';
+
+        item.innerHTML = `
+          <span class="format-item__label">${f.label}</span>
+          <span class="format-item__meta">${f.ext.toUpperCase()}${size}</span>
+        `;
+
+        item.addEventListener('click', () => {
+          formatList.querySelectorAll('.format-item').forEach(i => i.classList.remove('selected'));
+          item.classList.add('selected');
+          selectedItem = f;
+          Downloader.setSelectedFormat(f);
+        });
+
+        formatList.appendChild(item);
+      });
+    };
+
+    addGroup('Video Formats', videoFmts);
+    addGroup('Audio Formats', audioFmts);
+
+    // Auto-select best video
+    const best = formatList.querySelector('.format-item');
+    if (best) {
+      best.click();
     }
-
-    videoDuration.textContent = UI.formatDuration(meta.duration);
-    videoTypeBadge.textContent = meta.is_playlist
-      ? `Playlist · ${meta.playlist_count || '?'} videos`
-      : 'Video';
   }
 
-  // ════════════════════════════════════════════════════════
-  //  Render Format List
-  // ════════════════════════════════════════════════════════
-  function renderFormats(formats) {
+  function populateQualitySelect(formats) {
     qualityGroupUHD.innerHTML = '';
     qualityGroupHD.innerHTML  = '';
     qualityGroupSD.innerHTML  = '';
-    formatList.innerHTML      = '';
 
-    while (qualitySelect.options.length > 1) qualitySelect.remove(1);
+    const seen = new Set();
+    formats
+      .filter(f => f.category === 'video' && f.height)
+      .sort((a,b) => (b.height||0) - (a.height||0))
+      .forEach(f => {
+        const h = f.height;
+        if (seen.has(h)) return;
+        seen.add(h);
 
-    // Populate quality dropdown — video-only streams.
-    // The server will ALWAYS merge with best audio automatically.
-    const seenHeights = new Set();
-    formats.forEach(fmt => {
-      if (fmt.category !== 'video') return;
-      if (!fmt.height) return;
+        const opt = document.createElement('option');
+        opt.value = String(h);
+        opt.textContent = `${h}p${f.fps > 30 ? ` ${Math.round(f.fps)}fps` : ''}`;
 
-      // Deduplicate by height to keep dropdown clean
-      const heightKey = `${fmt.height}-${fmt.fps > 30 ? 'hfr' : 'std'}`;
-      if (seenHeights.has(heightKey)) return;
-      seenHeights.add(heightKey);
-
-      const opt = document.createElement('option');
-      // Store format_id as value — server adds +bestaudio automatically
-      opt.value = fmt.format_id;
-      opt.textContent = `${fmt.height}p${fmt.fps > 30 ? ` ${Math.round(fmt.fps)}fps` : ''} · ${fmt.ext.toUpperCase()} + Audio${fmt.filesize ? ' · ~' + UI.formatSize(fmt.filesize) : ''}`;
-
-      if (fmt.height >= 2160)     qualityGroupUHD.appendChild(opt);
-      else if (fmt.height >= 720) qualityGroupHD.appendChild(opt);
-      else                        qualityGroupSD.appendChild(opt);
-    });
-
-    // Populate detailed format list
-    formats.forEach(fmt => {
-      const el = document.createElement('div');
-      el.className = 'format-item';
-      el.setAttribute('role', 'option');
-      el.setAttribute('tabindex', '0');
-      el.dataset.formatId = fmt.format_id;
-      el.dataset.category = fmt.category;
-
-      const badge = document.createElement('span');
-      badge.className = `format-item__badge format-item__badge--${fmt.category}`;
-      badge.textContent = fmt.category;
-
-      const label = document.createElement('span');
-      label.textContent = `${fmt.format_id} · ${fmt.label}`;
-      if (fmt.resolution) label.textContent += ` · ${fmt.resolution}`;
-      // Make clear that video streams will get audio merged in
-      if (fmt.category === 'video') label.textContent += ' + audio';
-
-      const size = document.createElement('span');
-      size.className = 'format-item__size';
-      size.textContent = fmt.filesize ? UI.formatSize(fmt.filesize) : '';
-
-      el.appendChild(badge);
-      el.appendChild(label);
-      el.appendChild(size);
-
-      const selectFmt = () => {
-        document.querySelectorAll('.format-item').forEach(f => f.classList.remove('selected'));
-        el.classList.add('selected');
-        Downloader.setSelectedFormat(fmt.format_id);
-      };
-
-      el.addEventListener('click', selectFmt);
-      el.addEventListener('keydown', e => {
-        if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); selectFmt(); }
+        if (h >= 2160)     qualityGroupUHD.appendChild(opt);
+        else if (h >= 720) qualityGroupHD.appendChild(opt);
+        else               qualityGroupSD.appendChild(opt);
       });
+  }
 
-      formatList.appendChild(el);
-    });
+  // ════════════════════════════════════════════════════════
+  //  Download
+  // ════════════════════════════════════════════════════════
+  downloadBtn.addEventListener('click', async () => {
+    const isAudio = activeTab === 'audio';
+    const url     = urlInput.value.trim();
+    const playlist = playlistToggle?.checked || false;
 
-    if (!formatList.children.length) {
-      formatList.innerHTML = '<div style="padding:1rem;text-align:center;color:var(--clr-text-faint);font-size:0.82rem;">No formats available</div>';
+    let opts = { url, playlist };
+
+    if (isAudio) {
+      opts.audio_only    = true;
+      opts.audio_format  = $('audioFormatSelect')?.value  || 'mp3';
+      opts.audio_quality = $('audioQualitySelect')?.value || '0';
+      opts.embed_thumbnail = $('embedThumbAudio')?.checked ?? true;
+      opts.embed_metadata  = $('embedMetaAudio')?.checked  ?? true;
+    } else {
+      opts.audio_only = false;
+      const selFmt = Downloader.getSelectedFormat();
+      opts.format_id    = selFmt?.format_id || '';
+      opts.quality      = qualitySelect?.value || '';
+      opts.container    = $('containerSelect')?.value || 'mp4';
+      opts.embed_thumbnail = $('embedThumbVideo')?.checked ?? false;
+      opts.embed_metadata  = $('embedMetaVideo')?.checked  ?? true;
     }
-  }
 
-  // ════════════════════════════════════════════════════════
-  //  Download Flow — BUG FIX: Always read from activeTab
-  // ════════════════════════════════════════════════════════
-  function buildDownloadOptions() {
-    const meta      = Downloader.getCurrentMeta();
-    const url       = meta?.original_url || meta?.webpage_url || urlInput.value.trim();
-    const audioOnly = activeTab === 'audio';
-
-    // selected = format clicked in the format list (video-only stream ID e.g. "137")
-    // qualitySelect.value = dropdown value e.g. "bestvideo+bestaudio" or a format_id
-    const selected      = Downloader.getSelectedFormat();
-    const dropdownVal   = qualitySelect.value; // e.g. "bestvideo+bestaudio" or "137"
-
-    // For VIDEO: send format_id (from format list click) or leave empty so server
-    // uses its own fallback. NEVER send "bestvideo+bestaudio" as format_id — send
-    // it as quality so server handles the merge logic properly.
-    const isAutoQuality = !selected && (
-      dropdownVal === 'bestvideo+bestaudio' || dropdownVal === '' || !dropdownVal
-    );
-
-    return {
-      url,
-      audio_only:           audioOnly,
-      audio_format:         $('audioFormatSelect').value,
-      audio_quality:        $('audioQualitySelect').value,
-      // Send format_id only if user explicitly clicked a format from the list
-      // For audio: always empty — server uses -x flag
-      format_id:            audioOnly ? '' : (selected || ''),
-      // quality is used when no specific format_id is selected
-      quality:              audioOnly ? '' : (isAutoQuality ? '' : dropdownVal),
-      embed_thumbnail:      audioOnly ? $('embedThumbAudio').checked : $('embedThumbVideo').checked,
-      embed_metadata:       audioOnly ? $('embedMetaAudio').checked  : $('embedMetaVideo').checked,
-      embed_chapters:       !audioOnly && $('embedChapters').checked,
-      playlist:             playlistToggle.checked,
-      subtitles:            $('writeSubtitles').checked,
-      auto_subtitles:       $('writeAutoSubs').checked,
-      write_subtitles:      $('embedSubs').checked,
-      subtitle_lang:        $('subLangInput').value || 'en',
-      subtitle_format:      $('subFormatSelect').value,
-      proxy:                $('proxyInput').value || null,
-      rate_limit:           $('rateLimitInput').value || null,
-      cookies_from_browser: $('cookiesInput').value || null,
-      // Container format (video only) — e.g. mp4, mkv, webm, avi, mov
-      container:            audioOnly ? '' : ($('containerSelect')?.value || 'mp4'),
-      // Playlist range (Advanced tab)
-      playlist_start:       $('playlistStart')?.value ? parseInt($('playlistStart').value) : null,
-      playlist_end:         $('playlistEnd')?.value   ? parseInt($('playlistEnd').value)   : null,
-    };
-  }
-
-  async function initiateDownload() {
-    const opts     = buildDownloadOptions();
-    const audioOnly = opts.audio_only;
+    // Advanced options
+    opts.write_subtitles  = $('writeSubtitles')?.checked  || false;
+    opts.auto_subtitles   = $('writeAutoSubs')?.checked   || false;
+    opts.embed_subs       = $('embedSubs')?.checked       || false;
+    opts.subtitle_lang    = $('subLangInput')?.value.trim()  || 'en';
+    opts.subtitle_format  = $('subFormatSelect')?.value      || 'srt';
+    opts.rate_limit       = $('rateLimitInput')?.value.trim() || '';
 
     UI.showStep('stepProgress');
-    setProgressState(0, audioOnly ? 'Extracting audio…' : 'Preparing download…', '');
-    cancelBtn.classList.remove('hidden');
-    downloadFileBtn.classList.add('hidden');
-    newDownloadBtn.classList.add('hidden');
-
-    // Reset progress bar color
-    if (progressBarFill) progressBarFill.style.background = '';
+    setRingProgress(0);
+    progressTitle.textContent = 'Initializing…';
+    progressFilename.textContent = '';
+    if (cancelBtn) cancelBtn.classList.remove('hidden');
+    if (downloadFileBtn) downloadFileBtn.classList.add('hidden');
 
     try {
       const jobId = await Downloader.startDownload(opts);
 
-      UI.toast(audioOnly ? '🎵 Audio download started!' : '🎬 Video download started!', 'info');
+      cancelBtn && cancelBtn.addEventListener('click', async () => {
+        await Downloader.cancelJob(jobId);
+        progressTitle.textContent = 'Cancelled.';
+        cancelBtn.classList.add('hidden');
+        newDownloadBtn.classList.remove('hidden');
+      }, { once: true });
 
-      Downloader.pollStatus(jobId, onProgress, (status) => onComplete(status, opts), onError);
+      Downloader.pollStatus(jobId, onProgress, onComplete, onError);
     } catch (err) {
       onError(err);
     }
-  }
+  });
 
-  // ─── Progress handlers ────────────────────────────────────
+  // ── Progress Callbacks ─────────────────────────────────────────────────────
   function onProgress(status) {
     const pct = status.progress || 0;
-    setProgressState(
-      pct,
-      pct < 5  ? 'Connecting to servers…' :
-      pct < 95 ? `Downloading… ${pct.toFixed(1)}%` :
-      'Merging & processing…',
-      status.filename || '',
-    );
-    progressSpeed.textContent = status.speed ? `⚡ ${status.speed}` : '—';
-    progressEta.textContent   = status.eta   ? `⏱ ETA ${status.eta}` : '—';
-    progressSize.textContent  = status.filesize ? `📦 ${status.filesize}` : '—';
+    setRingProgress(pct);
+    progressTitle.textContent   = `Downloading ${pct.toFixed(1)}%`;
+    if (progressBarFill) progressBarFill.style.width = `${pct}%`;
+    if (progressPctText) progressPctText.textContent  = `${Math.round(pct)}%`;
+    if (progressSpeed)   progressSpeed.textContent    = status.speed   || '—';
+    if (progressEta)     progressEta.textContent      = status.eta     || '—';
+    if (progressSize)    progressSize.textContent     = status.filesize || '—';
   }
 
-  function onComplete(status, opts) {
-    // BUG FIX: Some formats (FLAC) may not report 100% but are complete.
-    // Force 100% on completion status regardless of last reported progress.
-    setProgressState(100, '✓ Download Complete!', status.filename || '');
-    if (progressBarFill) progressBarFill.style.background = 'linear-gradient(90deg, #22d3ee, #67e8f9)';
+  function onComplete(status) {
+    setRingProgress(100);
+    progressTitle.textContent = '✓ Download Complete!';
+    if (progressBarFill) progressBarFill.style.width = '100%';
+    if (progressPctText) progressPctText.textContent = '100%';
+    if (cancelBtn)       cancelBtn.classList.add('hidden');
+    if (progressFilename) progressFilename.textContent = status.filename || '';
 
-    const jobId = Downloader.getCurrentJobId() || status.job_id;
-    if (jobId) {
-      downloadFileBtn.href = Downloader.getFileUrl(jobId);
+    const fileUrl = Downloader.getFileUrl(status.job_id || Downloader.getCurrentJobId());
+    if (downloadFileBtn) {
+      downloadFileBtn.href     = fileUrl;
       downloadFileBtn.download = status.filename || 'download';
       downloadFileBtn.classList.remove('hidden');
     }
 
-    cancelBtn.classList.add('hidden');
-    newDownloadBtn.classList.remove('hidden');
-    progressSpeed.textContent = '✓ Done';
-    progressEta.textContent   = '';
+    UI.toast('File ready! Click "Save File" to download.', 'success');
+    newDownloadBtn && newDownloadBtn.classList.remove('hidden');
 
-    UI.toast('🌟 File ready! Click "Save File" to download.', 'success', 6000);
-
-    // Save to history
-    if (jobId) {
-      const meta = Downloader.getCurrentMeta();
-      History.add({
-        jobId,
-        title:     meta?.title     || 'Unknown',
-        thumbnail: meta?.thumbnail || '',
-        filename:  status.filename || 'download',
-        audioOnly: opts?.audio_only || false,
-        format:    opts?.audio_only ? (opts?.audio_format || 'mp3').toUpperCase() : 'Video',
-        date:      Date.now(),
-        fileUrl:   Downloader.getFileUrl(jobId),
-      });
-    }
+    // History
+    const meta = Downloader.getCurrentMeta();
+    History.add({
+      jobId:     status.job_id || Downloader.getCurrentJobId(),
+      title:     meta?.title    || 'YouTube Video',
+      uploader:  meta?.uploader || 'Unknown',
+      thumbnail: meta?.thumbnail || '',
+      filename:  status.filename || 'download',
+      format:    activeTab === 'audio' ? 'Audio' : 'Video',
+      fileUrl:   fileUrl,
+      date:      Date.now(),
+    });
   }
 
   function onError(err) {
-    // BUG FIX: Check if server marked complete despite error field — happens with some containers (FLAC, WAV)
-    // The worker sometimes exits 0 but yt-dlp output triggers error path
-    const msg = err?.message || 'Download failed. Please try again.';
-
-    // If error message suggests the file was actually created (post-processing error), show partial success
-    const isPostProcError = msg.includes('already exists') || msg.includes('Destination:') || msg.includes('ExtractAudio');
-    if (isPostProcError) {
-      const jobId = Downloader.getCurrentJobId();
-      if (jobId) {
-        downloadFileBtn.href = Downloader.getFileUrl(jobId);
-        downloadFileBtn.classList.remove('hidden');
-      }
-      setProgressState(100, '⚠ Processed with warnings', msg);
-      UI.toast('File may be ready despite warnings. Try "Save File".', 'warning', 6000);
-    } else {
-      setProgressState(0, '✗ Error', msg);
-      if (progressBarFill) progressBarFill.style.background = 'linear-gradient(90deg, var(--clr-error), #f87171)';
-    }
-
-    cancelBtn.classList.add('hidden');
-    newDownloadBtn.classList.remove('hidden');
-    if (!isPostProcError) UI.toast(msg, 'error', 6000);
+    progressTitle.textContent = '✗ Error';
+    UI.toast(err.message || 'Download failed.', 'error');
+    if (cancelBtn)     cancelBtn.classList.add('hidden');
+    if (newDownloadBtn) newDownloadBtn.classList.remove('hidden');
   }
 
-  function setProgressState(pct, title, subtitle) {
-    const clampedPct = Math.min(Math.max(pct, 0), 100);
-    progressTitle.textContent    = title;
-    progressFilename.textContent = subtitle;
-    progressBarFill.style.width  = `${clampedPct}%`;
-    progressPctText.textContent  = `${Math.round(clampedPct)}%`;
-    progressBarFill.closest('[role="progressbar"]').setAttribute('aria-valuenow', clampedPct);
-    setRingProgress(clampedPct);
-  }
+  // ── Navigation ─────────────────────────────────────────────────────────────
+  backBtn && backBtn.addEventListener('click', () => UI.showStep('stepUrl'));
 
-  // ════════════════════════════════════════════════════════
-  //  Button Events
-  // ════════════════════════════════════════════════════════
-  if (downloadBtn) {
-    downloadBtn.addEventListener('click', () => initiateDownload());
-  }
-
-  backBtn.addEventListener('click', () => {
-    UI.showStep('stepUrl');
-    Downloader.setSelectedFormat(null);
-  });
-
-  cancelBtn.addEventListener('click', async () => {
-    const jobId = Downloader.getCurrentJobId();
-    if (jobId) {
-      await Downloader.cancelJob(jobId);
-      UI.toast('Download cancelled.', 'warning');
-    }
-    UI.showStep('stepInfo');
-    cancelBtn.classList.add('hidden');
-  });
-
-  newDownloadBtn.addEventListener('click', () => {
-    Downloader.clearPolling();
+  newDownloadBtn && newDownloadBtn.addEventListener('click', () => {
     urlInput.value = '';
     validateUrl('');
-    urlInputWrapper.className = 'url-input-wrapper';
-    activeTab = 'video';
-    updateDownloadButton();
     UI.showStep('stepUrl');
-    window.scrollTo({ top: 0, behavior: 'smooth' });
+    if (downloadFileBtn) downloadFileBtn.classList.add('hidden');
+    newDownloadBtn.classList.add('hidden');
   });
 
   // ════════════════════════════════════════════════════════
   //  History System
   // ════════════════════════════════════════════════════════
-  const History = (function() {
-    // Per-user key based on browser fingerprint (no auth needed)
-    const USER_KEY = 'lunarytdl_user_' + _getUserId();
-    const HIST_KEY = USER_KEY + '_history';
-
-    function _getUserId() {
-      let id = localStorage.getItem('lunarytdl_uid');
-      if (!id) {
-        id = Math.random().toString(36).slice(2) + Date.now().toString(36);
-        localStorage.setItem('lunarytdl_uid', id);
-      }
-      return id;
-    }
+  const History = (function () {
+    const HIST_KEY = 'lunarmediadl_yt_history';
 
     function load() {
-      try {
-        return JSON.parse(localStorage.getItem(HIST_KEY) || '[]');
-      } catch { return []; }
+      try { return JSON.parse(localStorage.getItem(HIST_KEY) || '[]'); } catch { return []; }
     }
-
     function save(items) {
-      try {
-        localStorage.setItem(HIST_KEY, JSON.stringify(items.slice(0, 50)));
-      } catch { /* storage full */ }
+      try { localStorage.setItem(HIST_KEY, JSON.stringify(items.slice(0, 50))); } catch {}
     }
-
     function add(entry) {
-      const items = load();
-      // Avoid duplicates by jobId
-      const filtered = items.filter(i => i.jobId !== entry.jobId);
-      filtered.unshift(entry);
-      save(filtered);
+      const items = load().filter(i => i.jobId !== entry.jobId);
+      items.unshift(entry);
+      save(items);
       renderHistory();
     }
-
     async function remove(jobId) {
-      const items = load();
-      save(items.filter(i => i.jobId !== jobId));
-      // Also try to delete file from server
-      try {
-        await Downloader.cancelJob(jobId);
-      } catch { /* already gone */ }
+      save(load().filter(i => i.jobId !== jobId));
+      try { await Downloader.cancelJob(jobId); } catch {}
       renderHistory();
     }
-
     function clear() {
-      const items = load();
-      // Best-effort server cleanup
-      items.forEach(i => {
-        try { Downloader.cancelJob(i.jobId); } catch { /* ignore */ }
-      });
-      save([]);
+      try { localStorage.removeItem(HIST_KEY); } catch {}
       renderHistory();
     }
-
     return { load, add, remove, clear };
   })();
 
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  }
+
+  function relativeTime(ts) {
+    const d = Date.now() - ts;
+    if (d < 60000)    return 'Just now';
+    if (d < 3600000)  return `${Math.floor(d/60000)}m ago`;
+    if (d < 86400000) return `${Math.floor(d/3600000)}h ago`;
+    return `${Math.floor(d/86400000)}d ago`;
+  }
+
   function renderHistory() {
     if (!historyList) return;
-    const items = History.load();
-
-    // Remove existing item cards (keep empty state)
     historyList.querySelectorAll('.history-item').forEach(el => el.remove());
-
+    const items = History.load();
     if (!items.length) {
       if (historyEmpty) historyEmpty.style.display = '';
       return;
@@ -603,87 +501,44 @@
       el.className = 'history-item';
       el.innerHTML = `
         <div class="history-item__thumb">
-          ${item.thumbnail ? `<img src="${item.thumbnail}" alt="" loading="lazy"/>` : '<div class="history-item__thumb-placeholder"></div>'}
-          <span class="history-item__format-badge">${item.format || 'Video'}</span>
+          ${item.thumbnail ? `<img src="${escapeHtml(item.thumbnail)}" alt="" loading="lazy"/>` : '<div class="history-item__thumb-placeholder"></div>'}
+          <span class="history-item__format-badge">${escapeHtml(item.format||'Video')}</span>
         </div>
         <div class="history-item__info">
           <div class="history-item__title">${escapeHtml(item.title)}</div>
           <div class="history-item__meta">
-            <span>${item.filename || ''}</span>
-            <span class="history-item__date">${_relativeTime(item.date)}</span>
+            <span>${escapeHtml(item.filename||'')}</span>
+            <span class="history-item__date">${relativeTime(item.date)}</span>
           </div>
         </div>
         <div class="history-item__actions">
-          <a href="${item.fileUrl}" class="btn btn--ghost btn--xs" download title="Download again">
+          <a href="${escapeHtml(item.fileUrl)}" class="btn btn--ghost btn--xs" download title="Re-download">
             <svg viewBox="0 0 24 24" fill="none" width="14" height="14"><path d="M12 5v14M5 12l7 7 7-7" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"/></svg>
           </a>
-          <button class="btn btn--ghost btn--xs history-item__del" data-job="${item.jobId}" title="Remove">
+          <button class="btn btn--ghost btn--xs history-item__del" data-job="${escapeHtml(item.jobId)}" title="Remove">
             <svg viewBox="0 0 24 24" fill="none" width="14" height="14"><path d="M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
           </button>
         </div>
       `;
-
-      el.querySelector('.history-item__del').addEventListener('click', async (e) => {
-        const jobId = e.currentTarget.dataset.job;
-        await History.remove(jobId);
+      el.querySelector('.history-item__del').addEventListener('click', async e => {
+        await History.remove(e.currentTarget.dataset.job);
       });
-
       historyList.appendChild(el);
     });
   }
 
-  function escapeHtml(str) {
-    return str.replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-  }
+  function openHistory()  { renderHistory(); historyPanel.classList.add('open'); historyPanel.setAttribute('aria-hidden','false'); document.body.style.overflow = 'hidden'; }
+  function closeHistory() { historyPanel.classList.remove('open'); historyPanel.setAttribute('aria-hidden','true'); document.body.style.overflow = ''; }
 
-  function _relativeTime(ts) {
-    const diff = Date.now() - ts;
-    if (diff < 60000) return 'Just now';
-    if (diff < 3600000) return `${Math.floor(diff/60000)}m ago`;
-    if (diff < 86400000) return `${Math.floor(diff/3600000)}h ago`;
-    return `${Math.floor(diff/86400000)}d ago`;
-  }
-
-  // ── History Panel toggle ─────────────────────────────────
-  function openHistory() {
-    renderHistory();
-    historyPanel.classList.add('open');
-    historyPanel.setAttribute('aria-hidden', 'false');
-    document.body.style.overflow = 'hidden';
-  }
-
-  function closeHistory() {
-    historyPanel.classList.remove('open');
-    historyPanel.setAttribute('aria-hidden', 'true');
-    document.body.style.overflow = '';
-  }
-
-  if (historyToggleBtn) historyToggleBtn.addEventListener('click', openHistory);
-  if (historyCloseBtn)  historyCloseBtn.addEventListener('click', closeHistory);
-  if (historyBackdrop)  historyBackdrop.addEventListener('click', closeHistory);
-  if (clearHistoryBtn)  clearHistoryBtn.addEventListener('click', () => {
-    if (confirm('Clear all download history?')) {
-      History.clear();
-      UI.toast('History cleared.', 'info');
-    }
+  historyToggleBtn && historyToggleBtn.addEventListener('click', openHistory);
+  historyCloseBtn  && historyCloseBtn.addEventListener('click', closeHistory);
+  historyBackdrop  && historyBackdrop.addEventListener('click', closeHistory);
+  clearHistoryBtn  && clearHistoryBtn.addEventListener('click', () => {
+    if (confirm('Clear all download history?')) { History.clear(); UI.toast('History cleared.', 'info'); }
   });
-
-  // Close history on Escape
-  document.addEventListener('keydown', (e) => {
+  document.addEventListener('keydown', e => {
     if (e.key === 'Escape' && historyPanel?.classList.contains('open')) closeHistory();
   });
-
-  // ════════════════════════════════════════════════════════
-  //  Server Health Check
-  // ════════════════════════════════════════════════════════
-  async function checkServer() {
-    const health = await Downloader.checkHealth();
-    if (!health) {
-      UI.toast('⚠ Backend server not reachable. Start the server first.', 'warning', 8000);
-    } else {
-      console.info(`LunarYtdl: Server online — yt-dlp ${health.ytdlp_version}`);
-    }
-  }
 
   // ════════════════════════════════════════════════════════
   //  Init
@@ -692,15 +547,14 @@
     UI.init();
     injectProgressGradient();
     updateDownloadButton();
-    checkServer();
     renderHistory();
 
-    console.info('%cLunarYtdl v2.0.0', [
-      'color:#a78bfa', 'font-size:18px', 'font-weight:700',
-      'background:#050816', 'padding:8px 16px', 'border-radius:6px',
-    ].join(';'));
-    console.info('%cCreated by Syawaliuz Octavian', 'color:#67e8f9;font-size:11px');
+    // Auto-focus URL input
+    if (urlInput) urlInput.focus();
+
+    console.info('%cLunarMediaDL YouTube Module', 'color:#7c3aed;font-size:14px;font-weight:bold');
+    console.info('Engine: metube yt-dlp Python API | Proxy: removed | Cookies: YOUTUBE_COOKIES env var');
   }
 
-  init();
+  document.addEventListener('DOMContentLoaded', init);
 })();

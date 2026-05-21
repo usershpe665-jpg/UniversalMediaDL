@@ -311,24 +311,14 @@
                 Network
               </div>
               <div class="option-group">
-                <label class="option-label" for="proxyInput">Proxy URL</label>
-                <input type="text" id="proxyInput" class="input" placeholder="socks5://127.0.0.1:1080"/>
-              </div>
-              <div class="option-group">
                 <label class="option-label" for="rateLimitInput">Rate Limit</label>
                 <input type="text" id="rateLimitInput" class="input" placeholder="e.g. 1M"/>
               </div>
+              <!-- Cookies via server YOUTUBE_COOKIES env var -->
               <div class="option-group">
-                <label class="option-label" for="cookiesInput">Cookies from browser</label>
-                <div class="select-wrapper">
-                  <select id="cookiesInput" class="select">
-                    <option value="">None</option>
-                    <option value="chrome">Chrome</option>
-                    <option value="firefox">Firefox</option>
-                    <option value="safari">Safari</option>
-                    <option value="edge">Edge</option>
-                  </select>
-                </div>
+                <p class="option-hint" style="margin-top:0.5rem;color:var(--clr-text-muted)">
+                  🍪 Cookies loaded automatically via <code>YOUTUBE_COOKIES</code> env var on server.
+                </p>
               </div>
             </div>
           </div>

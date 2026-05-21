@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """
-LunarMediaDL - Backend Server
-Production-ready Universal Downloader API powered by yt-dlp
-Supports YouTube, TikTok, Instagram, and 1000+ other platforms.
+LunarMediaDL — Backend Server (Merged Edition)
+UI: UniversalMediaDL (space theme)
+Engine: metube-style yt-dlp Python API with proper download queue
+Cookies: YOUTUBE_COOKIES env var (plain Netscape text, no base64)
+Proxy: REMOVED
 """
 
 import os
@@ -13,15 +15,24 @@ import time
 import threading
 import logging
 import re
-import subprocess
+import queue
+import multiprocessing
 from pathlib import Path
 from datetime import datetime
-from urllib.parse import urlparse
 
+import yt_dlp
 from flask import Flask, request, jsonify, send_file, send_from_directory
 from flask_cors import CORS
 
-# ─── Configuration ────────────────────────────────────────────────────────────
+# ─── Logging ──────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
+logger = logging.getLogger("LunarMediaDL")
+
+# ─── Paths ────────────────────────────────────────────────────────────────────
 def _resolve_base_dir() -> Path:
     if wd := os.environ.get("WORKDIR"):
         return Path(wd)
@@ -35,237 +46,338 @@ def _resolve_base_dir() -> Path:
 
 BASE_DIR     = _resolve_base_dir()
 DOWNLOAD_DIR = BASE_DIR / "downloads"
-LOG_DIR      = BASE_DIR / "logs"
-STATE_DIR    = BASE_DIR / "state"
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
-LOG_DIR.mkdir(parents=True, exist_ok=True)
-STATE_DIR.mkdir(parents=True, exist_ok=True)
+COOKIES_FILE = BASE_DIR / "cookies.txt"
 
-# ─── Cookies ──────────────────────────────────────────────────────────────────
-# Cookies bisa disediakan dengan dua cara (prioritas dari atas ke bawah):
-#
-#   1. Upload via UI  → POST /api/cookies/upload  (disimpan di state/cookies.txt)
-#   2. Env var Railway → YOUTUBE_COOKIES
-#      Isi variabelnya dengan konten cookies.txt mentah (format Netscape),
-#      persis seperti isi file cookies.txt, tanpa encoding apapun.
-#
-COOKIES_FILE = STATE_DIR / "cookies.txt"
+# ─── Cookies (plain text from env, no base64) ─────────────────────────────────
+def _ensure_cookies():
+    """Write YOUTUBE_COOKIES env var (plain Netscape text) to cookies.txt."""
+    raw = os.environ.get("YOUTUBE_COOKIES", "").strip()
+    if not raw:
+        return
+    if COOKIES_FILE.exists() and COOKIES_FILE.stat().st_size > 0:
+        return
+    try:
+        COOKIES_FILE.write_text(raw, encoding="utf-8")
+        logger.info(f"Cookies written from YOUTUBE_COOKIES env var ({len(raw)} chars)")
+    except Exception as e:
+        logger.warning(f"Failed to write cookies: {e}")
 
-# ─── Proxy ────────────────────────────────────────────────────────────────────
-DEFAULT_PROXY = os.environ.get("PROXY_URL", "").strip()
+_ensure_cookies()
 
-# ─── Logging ──────────────────────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler(LOG_DIR / "server.log"),
-    ],
-)
-logger = logging.getLogger("LunarMediaDL")
+def _get_cookie_opts() -> dict:
+    if COOKIES_FILE.exists() and COOKIES_FILE.stat().st_size > 0:
+        return {"cookiefile": str(COOKIES_FILE)}
+    return {}
 
-# ─── App Init ─────────────────────────────────────────────────────────────────
+# ─── Flask App ────────────────────────────────────────────────────────────────
 app = Flask(__name__, static_folder=str(BASE_DIR), static_url_path="")
-
-@app.before_request
-def _log_base_dir_once():
-    if not getattr(app, "_base_dir_logged", False):
-        app._base_dir_logged = True
-        logger.info(f"📁 BASE_DIR resolved to: {BASE_DIR}")
-        logger.info(f"   index.html exists: {(BASE_DIR / 'index.html').exists()}")
-        logger.info(f"   downloader.html exists: {(BASE_DIR / 'downloader.html').exists()}")
-        logger.info(f"🌐 Default proxy: {DEFAULT_PROXY or 'none (direct connection)'}")
-        _auto_load_cookies()
-
 CORS(app, resources={r"/api/*": {"origins": "*"}})
 
 # ─── In-Memory Job Store ──────────────────────────────────────────────────────
-jobs      = {}
-jobs_lock = threading.Lock()
+jobs: dict = {}
+jobs_lock   = threading.Lock()
 
-# Runtime overrides — thread-safe key-value untuk setting aktif (e.g. cookiefile)
-_runtime_overrides: dict = {}
-_overrides_lock = threading.Lock()
+# ─── yt-dlp Progress Logger ──────────────────────────────────────────────────
 
-def set_runtime_override(key: str, value):
-    with _overrides_lock:
-        _runtime_overrides[key] = value
+class _SilentLogger:
+    def debug(self, msg): pass
+    def warning(self, msg): logger.warning(f"yt-dlp: {msg}")
+    def error(self, msg):   logger.error(f"yt-dlp: {msg}")
 
-def remove_runtime_override(key: str):
-    with _overrides_lock:
-        _runtime_overrides.pop(key, None)
+# ─── Download Worker (metube-style: yt-dlp Python API + multiprocessing) ─────
 
-def get_runtime_override(key: str):
-    with _overrides_lock:
-        return _runtime_overrides.get(key)
+def _download_process(job_id: str, url: str, opts: dict, status_q, download_dir: str, cookies_file: str):
+    """
+    Runs in a separate process (like metube).
+    Uses yt-dlp Python API — not subprocess.
+    Sends status dicts through status_q.
+    """
+    audio_only    = opts.get("audio_only", False)
+    audio_format  = opts.get("audio_format", "mp3")
+    audio_quality = opts.get("audio_quality", "0")
+    format_id     = opts.get("format_id", "")
+    quality       = opts.get("quality", "")
+    playlist      = opts.get("playlist", False)
+    embed_thumb   = opts.get("embed_thumbnail", False)
+    embed_meta    = opts.get("embed_metadata", True)
+    write_subs    = opts.get("write_subtitles", False)
+    auto_subs     = opts.get("auto_subtitles", False)
+    embed_subs    = opts.get("embed_subs", False)
+    sub_lang      = opts.get("subtitle_lang", "en")
+    sub_fmt       = opts.get("subtitle_format", "srt")
+    rate_limit    = opts.get("rate_limit", "")
+    container     = opts.get("container", "mp4")
+
+    dl_dir = Path(download_dir)
+
+    # ── Format selection (metube-style logic) ─────────────────────────────────
+    if audio_only:
+        fmt = f"bestaudio[ext={audio_format}]/bestaudio/best"
+    elif format_id:
+        fmt = f"{format_id}+bestaudio[ext=m4a]/{format_id}+bestaudio/{format_id}/bestvideo+bestaudio/best"
+    elif quality and quality not in ("best", "bestvideo+bestaudio", ""):
+        # quality is like "1080", "720", etc.
+        fmt = f"bestvideo[height<={quality}]+bestaudio/best[height<={quality}]/bestvideo+bestaudio/best"
+    else:
+        fmt = "bestvideo+bestaudio/best"
+
+    # ── Output template ───────────────────────────────────────────────────────
+    if playlist:
+        outtmpl = str(dl_dir / "%(playlist_title)s" / "%(playlist_index)s - %(title)s.%(ext)s")
+    else:
+        outtmpl = str(dl_dir / "%(title)s.%(ext)s")
+
+    # ── Postprocessors (metube-style) ─────────────────────────────────────────
+    postprocessors = []
+
+    if audio_only:
+        postprocessors.append({
+            "key": "FFmpegExtractAudio",
+            "preferredcodec": audio_format,
+            "preferredquality": int(audio_quality) if audio_quality.isdigit() else 0,
+        })
+        if audio_format not in ("wav",):
+            postprocessors.append({"key": "FFmpegThumbnailsConvertor", "format": "jpg", "when": "before_dl"})
+            postprocessors.append({"key": "FFmpegMetadata"})
+            postprocessors.append({"key": "EmbedThumbnail"})
+    else:
+        if embed_thumb:
+            postprocessors.append({"key": "FFmpegThumbnailsConvertor", "format": "jpg", "when": "before_dl"})
+            postprocessors.append({"key": "EmbedThumbnail"})
+        if embed_meta:
+            postprocessors.append({"key": "FFmpegMetadata", "add_metadata": True, "add_chapters": True})
+        if embed_subs:
+            postprocessors.append({"key": "FFmpegEmbedSubtitle", "already_have_subtitle": False})
+
+    # ── Progress hook (sends to queue) ────────────────────────────────────────
+    output_filename = []
+
+    def progress_hook(d):
+        st = d.get("status")
+        if st == "downloading":
+            total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+            down  = d.get("downloaded_bytes", 0)
+            pct   = (down / total * 100) if total else 0
+            speed = d.get("speed") or 0
+            eta   = d.get("eta")
+
+            def _fmt_speed(bps):
+                if not bps: return "—"
+                if bps > 1_048_576: return f"{bps/1_048_576:.1f} MB/s"
+                if bps > 1024:      return f"{bps/1024:.1f} KB/s"
+                return f"{int(bps)} B/s"
+
+            status_q.put({
+                "type":     "progress",
+                "progress": round(pct, 1),
+                "speed":    _fmt_speed(speed),
+                "eta":      f"{int(eta)}s" if eta else "—",
+                "filesize": _fmt_bytes(total),
+            })
+
+        elif st == "finished":
+            fname = d.get("filename", "")
+            if fname:
+                output_filename.append(fname)
+
+    def postprocessor_hook(d):
+        if d.get("postprocessor") == "MoveFiles" and d.get("status") == "finished":
+            info = d.get("info_dict", {})
+            fp   = info.get("filepath") or info.get("filename", "")
+            if fp:
+                output_filename.append(fp)
+
+    def _fmt_bytes(n):
+        if not n: return "—"
+        if n > 1_073_741_824: return f"{n/1_073_741_824:.1f} GB"
+        if n > 1_048_576:     return f"{n/1_048_576:.1f} MB"
+        if n > 1024:          return f"{n/1024:.1f} KB"
+        return f"{int(n)} B"
+
+    # ── yt-dlp params (metube-style Python API) ───────────────────────────────
+    ydl_params = {
+        "quiet":          True,
+        "no_color":       True,
+        "logger":         _SilentLogger(),
+        "format":         fmt,
+        "outtmpl":        outtmpl,
+        "paths":          {"home": str(dl_dir)},
+        "socket_timeout": 60,
+        "retries":        5,
+        "fragment_retries": 5,
+        "extractor_retries": 3,
+        "postprocessors": postprocessors,
+        "progress_hooks": [progress_hook],
+        "postprocessor_hooks": [postprocessor_hook],
+        "writethumbnail": embed_thumb or audio_only,
+        "noplaylist":     not playlist,
+    }
+
+    # Merge output format
+    if not audio_only:
+        ydl_params["merge_output_format"] = container
+
+    # Subtitles
+    if write_subs:
+        ydl_params["writesubtitles"]   = True
+        ydl_params["subtitleslangs"]   = [sub_lang]
+        ydl_params["subtitlesformat"]  = sub_fmt
+    if auto_subs:
+        ydl_params["writeautomaticsub"] = True
+        ydl_params["subtitleslangs"]   = [sub_lang]
+
+    # Rate limit
+    if rate_limit:
+        ydl_params["ratelimit"] = rate_limit
+
+    # Cookies (plain text file)
+    if Path(cookies_file).exists() and Path(cookies_file).stat().st_size > 0:
+        ydl_params["cookiefile"] = cookies_file
+
+    # ── Run ───────────────────────────────────────────────────────────────────
+    try:
+        status_q.put({"type": "status", "status": "downloading"})
+        with yt_dlp.YoutubeDL(params=ydl_params) as ydl:
+            ret = ydl.download([url])
+
+        # Resolve final file
+        final_file = ""
+        if output_filename:
+            # Try last reported, then scan directory
+            for candidate in reversed(output_filename):
+                p = Path(candidate)
+                if p.exists():
+                    final_file = str(p)
+                    break
+
+        if not final_file:
+            # Fall back: newest file in download dir
+            files = sorted(
+                [f for f in dl_dir.rglob("*.*") if f.is_file()],
+                key=lambda f: f.stat().st_mtime,
+                reverse=True,
+            )
+            if files:
+                final_file = str(files[0])
+
+        if ret == 0 and final_file:
+            status_q.put({"type": "completed", "filepath": final_file, "filename": Path(final_file).name})
+        else:
+            status_q.put({"type": "error", "msg": "Download failed or file not found."})
+
+    except yt_dlp.utils.YoutubeDLError as exc:
+        status_q.put({"type": "error", "msg": str(exc)})
+    except Exception as exc:
+        status_q.put({"type": "error", "msg": f"Unexpected error: {exc}"})
+
+
+def _download_worker(job_id: str, url: str, opts: dict):
+    """Thread: starts subprocess, reads queue, updates job state."""
+    manager = multiprocessing.Manager()
+    status_q = manager.Queue()
+
+    proc = multiprocessing.Process(
+        target=_download_process,
+        args=(job_id, url, opts, status_q, str(DOWNLOAD_DIR), str(COOKIES_FILE)),
+        daemon=True,
+    )
+    proc.start()
+
+    while True:
+        try:
+            msg = status_q.get(timeout=1)
+        except Exception:
+            if not proc.is_alive():
+                break
+            continue
+
+        if msg is None:
+            break
+
+        t = msg.get("type")
+
+        if t == "status":
+            with jobs_lock:
+                jobs[job_id]["status"] = msg.get("status", "downloading")
+
+        elif t == "progress":
+            with jobs_lock:
+                jobs[job_id].update({
+                    "progress": msg.get("progress", 0),
+                    "speed":    msg.get("speed"),
+                    "eta":      msg.get("eta"),
+                    "filesize": msg.get("filesize"),
+                })
+
+        elif t == "completed":
+            with jobs_lock:
+                jobs[job_id].update({
+                    "status":   "completed",
+                    "progress": 100,
+                    "filename": msg.get("filename"),
+                    "filepath": msg.get("filepath"),
+                })
+            logger.info(f"Job {job_id[:8]} completed: {msg.get('filepath')}")
+            break
+
+        elif t == "error":
+            with jobs_lock:
+                jobs[job_id].update({
+                    "status": "error",
+                    "error":  msg.get("msg", "Unknown error"),
+                })
+            logger.warning(f"Job {job_id[:8]} error: {msg.get('msg')}")
+            break
+
+    proc.join(timeout=5)
+    proc.terminate()
+    manager.shutdown()
+
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def is_valid_url(url: str) -> bool:
-    url_stripped = url.strip()
-    return url_stripped.startswith("http://") or url_stripped.startswith("https://")
+    u = url.strip()
+    return u.startswith("http://") or u.startswith("https://")
 
 def sanitize_filename(name: str) -> str:
     return re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name)[:200]
 
 def cleanup_old_files(max_age_hours: int = 4):
-    """Remove download files older than max_age_hours."""
     cutoff = time.time() - max_age_hours * 3600
-    for f in DOWNLOAD_DIR.iterdir():
+    for f in DOWNLOAD_DIR.rglob("*.*"):
         if f.is_file() and f.stat().st_mtime < cutoff:
             try:
                 f.unlink()
-                logger.info(f"Cleaned up old file: {f.name}")
             except OSError:
                 pass
-
-def cleanup_old_jobs(max_age_hours: int = 4):
-    """Hapus job lama dari memori untuk mencegah memory leak."""
-    cutoff = time.time() - max_age_hours * 3600
-    to_remove = []
-    with jobs_lock:
-        for jid, job in jobs.items():
-            if job["status"] in ("completed", "error") and job.get("created_at", 0) < cutoff:
-                to_remove.append(jid)
-        for jid in to_remove:
-            jobs.pop(jid, None)
-    if to_remove:
-        logger.info(f"Cleaned up {len(to_remove)} old jobs from memory")
-
-def _load_cookies_from_env():
-    raw = os.environ.get("YOUTUBE_COOKIES", "").strip()
-    if not raw:
-        return
-    if COOKIES_FILE.exists() and COOKIES_FILE.stat().st_size > 0:
-        logger.debug("Cookies file already exists (uploaded via UI), skipping env var load")
-        return
-    try:
-        content = raw.encode("utf-8")
-        tmp_path = Path(str(COOKIES_FILE) + ".tmp")
-        tmp_path.write_bytes(content)
-        tmp_path.replace(COOKIES_FILE)
-        set_runtime_override("cookiefile", str(COOKIES_FILE))
-        logger.info(f"Cookies loaded from env var YOUTUBE_COOKIES ({len(content)} bytes)")
-    except Exception as e:
-        logger.warning(f"Failed to write cookies from YOUTUBE_COOKIES env var: {e}")
-
-def _auto_load_cookies():
-    if COOKIES_FILE.exists() and COOKIES_FILE.stat().st_size > 0:
-        set_runtime_override("cookiefile", str(COOKIES_FILE))
-        logger.info(f"Cookie file detected at {COOKIES_FILE}")
-        return
-    _load_cookies_from_env()
-
-def get_cookies_args() -> list:
-    """Kembalikan argumen --cookies untuk yt-dlp jika cookies tersedia."""
-    cookiefile = get_runtime_override("cookiefile")
-    if cookiefile and Path(cookiefile).exists() and Path(cookiefile).stat().st_size > 0:
-        return ["--cookies", cookiefile]
-    return []
-
-def get_proxy_args(user_proxy: str = None) -> list:
-    proxy = (user_proxy or "").strip() or DEFAULT_PROXY
-    if proxy:
-        logger.info(f"🌐 Using proxy: {proxy}")
-        return ["--proxy", proxy]
-    return []
-
-def run_ytdlp(args: list) -> subprocess.CompletedProcess:
-    cmd = ["yt-dlp"] + args
-    return subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-
-def _find_latest_file(hint_name: str = None) -> Path | None:
-    """Cari file media terbaru di DOWNLOAD_DIR.
-    File gambar (.jpg/.png/.webp) diabaikan kecuali tidak ada file lain,
-    agar thumbnail sementara tidak dikembalikan sebagai hasil download.
-    """
-    _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".jfif"}
-
-    if hint_name:
-        hint_path = Path(hint_name)
-        if hint_path.exists() and hint_path.is_file():
-            return hint_path
-        candidate = DOWNLOAD_DIR / hint_path.name
-        if candidate.exists() and candidate.is_file():
-            return candidate
-
-    all_files = sorted(
-        [f for f in DOWNLOAD_DIR.glob("*.*") if f.is_file()],
-        key=lambda f: f.stat().st_mtime,
-        reverse=True,
-    )
-    # Prioritaskan file audio/video, bukan thumbnail gambar
-    media_files = [f for f in all_files if f.suffix.lower() not in _IMAGE_EXTS]
-    if media_files:
-        return media_files[0]
-    return all_files[0] if all_files else None
-
-def _extract_error_message(output: str) -> str:
-    """Ekstrak pesan error yang paling relevan dari output yt-dlp."""
-    if not output:
-        return "Unknown error"
-    lines = [l.strip() for l in output.strip().splitlines() if l.strip()]
-    for line in reversed(lines):
-        if any(kw in line for kw in ("ERROR:", "Error:", "error:", "WARNING:", "Sign in")):
-            line = re.sub(r'^(ERROR|WARNING):\s*', '', line)
-            return line
-    return lines[-1] if lines else "Unknown error"
-
-def _format_bytes(n) -> str:
-    """Format bytes ke string yang mudah dibaca (seperti metube)."""
-    try:
-        n = float(n)
-    except (TypeError, ValueError):
-        return "?"
-    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
-        if abs(n) < 1024.0:
-            return f"{n:.1f}{unit}"
-        n /= 1024.0
-    return f"{n:.1f}PiB"
-
-def _format_speed(bps) -> str:
-    """Format kecepatan download (bytes/s) ke string yang akurat."""
-    try:
-        bps = float(bps)
-    except (TypeError, ValueError):
-        return None
-    return f"{_format_bytes(bps)}/s"
-
-def _format_eta(seconds) -> str:
-    """Format ETA (seconds) ke string yang akurat."""
-    try:
-        secs = int(seconds)
-    except (TypeError, ValueError):
-        return None
-    if secs < 0:
-        return None
-    hours, rem = divmod(secs, 3600)
-    mins, secs2 = divmod(rem, 60)
-    if hours:
-        return f"{hours:02d}:{mins:02d}:{secs2:02d}"
-    return f"{mins:02d}:{secs2:02d}"
 
 # ─── Static Routes ────────────────────────────────────────────────────────────
 
 @app.route("/", methods=["GET"])
 def serve_index():
-    index_path = BASE_DIR / "index.html"
-    if not index_path.exists():
-        return (
-            f"<h2>index.html not found</h2>"
-            f"<p>BASE_DIR = <code>{BASE_DIR}</code></p>"
-            f"<p>Files in BASE_DIR: {[f.name for f in BASE_DIR.iterdir() if f.is_file()]}</p>"
-            f"<p>Set the <code>WORKDIR</code> environment variable to the directory containing your HTML files.</p>",
-            200,
-            {"Content-Type": "text/html"},
-        )
     return send_from_directory(str(BASE_DIR), "index.html")
 
 @app.route("/downloader", methods=["GET"])
 @app.route("/downloader.html", methods=["GET"])
 def serve_downloader():
     return send_from_directory(str(BASE_DIR), "downloader.html")
+
+@app.route("/universal", methods=["GET"])
+@app.route("/universal.html", methods=["GET"])
+def serve_universal():
+    return send_from_directory(str(BASE_DIR), "universal.html")
+
+@app.route("/tiktok", methods=["GET"])
+@app.route("/tiktok.html", methods=["GET"])
+def serve_tiktok():
+    return send_from_directory(str(BASE_DIR), "tiktok.html")
+
+@app.route("/instagram", methods=["GET"])
+@app.route("/instagram.html", methods=["GET"])
+def serve_instagram():
+    return send_from_directory(str(BASE_DIR), "instagram.html")
 
 @app.route("/<path:filename>", methods=["GET"])
 def serve_static(filename):
@@ -274,127 +386,27 @@ def serve_static(filename):
         abort(404)
     return send_from_directory(str(BASE_DIR), filename)
 
-# ─── Health ───────────────────────────────────────────────────────────────────
+# ─── API: Health ──────────────────────────────────────────────────────────────
 
 @app.route("/api/health", methods=["GET"])
 def health_check():
     try:
-        result = run_ytdlp(["--version"])
-        ytdlp_version = result.stdout.strip()
-    except FileNotFoundError:
-        ytdlp_version = "not found"
+        import yt_dlp
+        ytdlp_version = yt_dlp.version.__version__
     except Exception as e:
         ytdlp_version = f"error: {e}"
 
-    cookiefile  = get_runtime_override("cookiefile")
-    cookies_ok  = bool(cookiefile and Path(cookiefile).exists() and Path(cookiefile).stat().st_size > 0)
-    has_env_var = bool(os.environ.get("YOUTUBE_COOKIES", "").strip())
-    has_file    = COOKIES_FILE.exists() and COOKIES_FILE.stat().st_size > 0
-
-    if has_file and not has_env_var:
-        cookies_src = "uploaded_file"
-    elif has_env_var:
-        cookies_src = "env_var (YOUTUBE_COOKIES)"
-    else:
-        cookies_src = "none"
-
+    cookies_ok = COOKIES_FILE.exists() and COOKIES_FILE.stat().st_size > 0
     return jsonify({
         "status":         "online",
-        "server":         "LunarMediaDL v2.2.0",
+        "server":         "LunarMediaDL v3.0.0 (Merged)",
         "ytdlp_version":  ytdlp_version,
         "timestamp":      datetime.utcnow().isoformat(),
         "cookies_loaded": cookies_ok,
-        "cookies_source": cookies_src,
-        "proxy_active":   bool(DEFAULT_PROXY),
-        "proxy":          DEFAULT_PROXY or "none (direct connection)",
+        "cookies_source": "YOUTUBE_COOKIES env var" if os.environ.get("YOUTUBE_COOKIES") else ("file" if cookies_ok else "none"),
     })
 
-# ─── Cookies API ──────────────────────────────────────────────────────────────
-
-@app.route("/api/cookies/upload", methods=["POST"])
-def upload_cookies():
-    MAX_SIZE = 1_000_000  # 1MB
-
-    content = None
-    if request.content_type and "multipart" in request.content_type:
-        f = request.files.get("cookies")
-        if f is None:
-            return jsonify({"status": "error", "msg": "No 'cookies' field in multipart form"}), 400
-        content = f.read(MAX_SIZE + 1)
-    else:
-        content = request.get_data()
-
-    if not content:
-        return jsonify({"status": "error", "msg": "No cookies data provided"}), 400
-    if len(content) > MAX_SIZE:
-        return jsonify({"status": "error", "msg": "Cookie file too large (max 1MB)"}), 400
-
-    try:
-        text = content.decode("utf-8", errors="replace")
-        if not any(line.strip() and not line.startswith("#") for line in text.splitlines()):
-            return jsonify({"status": "error", "msg": "File tampak kosong atau tidak valid"}), 400
-    except Exception:
-        pass
-
-    tmp_path = Path(str(COOKIES_FILE) + ".tmp")
-    try:
-        tmp_path.write_bytes(content)
-        tmp_path.replace(COOKIES_FILE)
-        set_runtime_override("cookiefile", str(COOKIES_FILE))
-        logger.info(f"Cookies file uploaded ({len(content)} bytes)")
-        return jsonify({"status": "ok", "msg": f"Cookies uploaded ({len(content)} bytes)"})
-    except Exception as e:
-        logger.error(f"Failed to save cookies: {e}")
-        return jsonify({"status": "error", "msg": f"Failed to save cookies: {e}"}), 500
-
-@app.route("/api/cookies/delete", methods=["DELETE", "POST"])
-def delete_cookies():
-    has_uploaded = COOKIES_FILE.exists()
-    has_env_var  = bool(os.environ.get("YOUTUBE_COOKIES", "").strip())
-
-    if not has_uploaded:
-        if has_env_var:
-            return jsonify({
-                "status": "error",
-                "msg": "Cookies aktif berasal dari env var YOUTUBE_COOKIES di Railway. Hapus atau kosongkan env var tersebut untuk menonaktifkan."
-            }), 400
-        return jsonify({"status": "error", "msg": "Tidak ada cookies yang di-upload"}), 400
-
-    try:
-        COOKIES_FILE.unlink()
-        remove_runtime_override("cookiefile")
-        if has_env_var:
-            _load_cookies_from_env()
-            return jsonify({"status": "ok", "msg": "Cookies file dihapus. Cookies dari env var YOUTUBE_COOKIES diaktifkan kembali."})
-        logger.info("Cookies file deleted")
-        return jsonify({"status": "ok", "msg": "Cookies berhasil dihapus"})
-    except Exception as e:
-        logger.error(f"Failed to delete cookies: {e}")
-        return jsonify({"status": "error", "msg": f"Gagal menghapus cookies: {e}"}), 500
-
-@app.route("/api/cookies/status", methods=["GET"])
-def cookies_status():
-    cookiefile  = get_runtime_override("cookiefile")
-    has_cookies = bool(cookiefile and Path(cookiefile).exists() and Path(cookiefile).stat().st_size > 0)
-    has_env_var = bool(os.environ.get("YOUTUBE_COOKIES", "").strip())
-    has_file    = COOKIES_FILE.exists() and COOKIES_FILE.stat().st_size > 0
-
-    if has_file and not has_env_var:
-        source = "uploaded_file"
-    elif has_file and has_env_var:
-        source = "uploaded_file"
-    elif has_env_var:
-        source = "env_var (YOUTUBE_COOKIES)"
-    else:
-        source = "none"
-
-    return jsonify({
-        "status":      "ok",
-        "has_cookies": has_cookies,
-        "source":      source,
-    })
-
-# ─── Info ─────────────────────────────────────────────────────────────────────
+# ─── API: Info ────────────────────────────────────────────────────────────────
 
 @app.route("/api/info", methods=["POST"])
 def fetch_info():
@@ -404,74 +416,61 @@ def fetch_info():
     if not url:
         return jsonify({"error": "URL is required"}), 400
     if not is_valid_url(url):
-        return jsonify({"error": "Invalid or unsupported URL"}), 422
+        return jsonify({"error": "Invalid URL. Must start with http:// or https://"}), 422
 
-    logger.info(f"Fetching info for: {url}")
+    logger.info(f"Fetching info: {url}")
 
-    user_proxy = (data.get("proxy") or "").strip()
-
-    args = [
-        url, "--dump-json",
-        "--no-playlist" if not data.get("playlist") else "--yes-playlist",
-        "--no-warnings",
-        "--no-check-formats",
-        "--ignore-no-formats-error",
-        "--socket-timeout", "30", "--retries", "3",
-        "--extractor-retries", "3",
-    ] + get_cookies_args() + get_proxy_args(user_proxy)
-
-    cfb = (data.get("cookies_from_browser") or "").strip()
-    if cfb:
-        args += ["--cookies-from-browser", cfb]
+    ydl_opts = {
+        "quiet":            True,
+        "no_color":         True,
+        "logger":           _SilentLogger(),
+        "noplaylist":       not data.get("playlist", False),
+        "socket_timeout":   30,
+        "retries":          3,
+        "extractor_retries": 3,
+    }
+    ydl_opts.update(_get_cookie_opts())
 
     try:
-        result = run_ytdlp(args)
-    except subprocess.TimeoutExpired:
-        return jsonify({"error": "Request timed out. Coba lagi."}), 504
-    except FileNotFoundError:
-        return jsonify({"error": "yt-dlp tidak terinstall di server"}), 500
+        with yt_dlp.YoutubeDL(params=ydl_opts) as ydl:
+            meta = ydl.extract_info(url, download=False)
+    except yt_dlp.utils.YoutubeDLError as exc:
+        logger.warning(f"yt-dlp info error: {exc}")
+        return jsonify({"error": f"Failed to fetch media info: {str(exc)}"}), 400
+    except Exception as exc:
+        logger.exception("Unexpected info error")
+        return jsonify({"error": str(exc)}), 500
 
-    if result.returncode != 0:
-        raw_err = (result.stderr or result.stdout or "").strip()
-        err_msg = _extract_error_message(raw_err)
-        logger.warning(f"yt-dlp info error: {err_msg}")
-        return jsonify({"error": f"Gagal mengambil info media: {err_msg}"}), 400
+    if meta is None:
+        return jsonify({"error": "No media data returned"}), 400
 
-    lines = [l for l in result.stdout.strip().split("\n") if l.startswith("{")]
-    if not lines:
-        return jsonify({"error": "Tidak ada data media yang dikembalikan"}), 400
-
-    try:
-        meta = json.loads(lines[0])
-    except json.JSONDecodeError:
-        return jsonify({"error": "Gagal mem-parse data media"}), 500
-
-    # Build format list
+    # Build format list (metube-style dedup + labeling)
     formats = []
-    seen    = set()
+    seen = set()
     for f in (meta.get("formats") or []):
-        fid    = f.get("format_id", "")
-        ext    = f.get("ext", "")
         vcodec = f.get("vcodec", "none")
         acodec = f.get("acodec", "none")
-        height = f.get("height")
-        width  = f.get("width")
-        tbr    = f.get("tbr")
-        fps    = f.get("fps")
-        fsize  = f.get("filesize") or f.get("filesize_approx")
-
         if vcodec == "none" and acodec == "none":
             continue
 
-        label_parts = []
-        if height:            label_parts.append(f"{height}p")
-        if fps and fps > 30:  label_parts.append(f"{int(fps)}fps")
-        if ext:               label_parts.append(ext.upper())
-
+        fid    = f.get("format_id", "")
+        ext    = f.get("ext", "")
+        height = f.get("height")
+        width  = f.get("width")
+        fps    = f.get("fps")
+        tbr    = f.get("tbr")
+        fsize  = f.get("filesize") or f.get("filesize_approx")
         category = "video" if vcodec != "none" else "audio"
-        key      = f"{height}-{ext}-{category}"
-        if key in seen: continue
+
+        key = f"{height}-{ext}-{category}"
+        if key in seen:
+            continue
         seen.add(key)
+
+        label_parts = []
+        if height:           label_parts.append(f"{height}p")
+        if fps and fps > 30: label_parts.append(f"{int(fps)}fps")
+        if ext:              label_parts.append(ext.upper())
 
         formats.append({
             "format_id":  fid,
@@ -489,6 +488,7 @@ def fetch_info():
 
     formats.sort(key=lambda x: (0 if x["category"] == "video" else 1, -(x["height"] or 0)))
 
+    # Subtitles
     subtitles = {}
     for lang, subs in (meta.get("subtitles") or {}).items():
         if subs:
@@ -499,34 +499,28 @@ def fetch_info():
         if subs:
             auto_subs[lang] = [{"ext": s.get("ext"), "name": s.get("name", lang)} for s in subs[:3]]
 
-    is_playlist    = bool(data.get("playlist") and len(lines) > 1)
-    playlist_count = len(lines) if is_playlist else None
-
     response = {
-        "id":               meta.get("id"),
-        "title":            meta.get("title"),
-        "uploader":         meta.get("uploader") or meta.get("channel"),
-        "duration":         meta.get("duration"),
-        "duration_string":  meta.get("duration_string"),
-        "view_count":       meta.get("view_count"),
-        "like_count":       meta.get("like_count"),
-        "thumbnail":        meta.get("thumbnail"),
-        "description":      (meta.get("description") or "")[:500],
-        "upload_date":      meta.get("upload_date"),
-        "formats":          formats,
-        "subtitles":        subtitles,
+        "id":                 meta.get("id"),
+        "title":              meta.get("title"),
+        "uploader":           meta.get("uploader") or meta.get("channel"),
+        "duration":           meta.get("duration"),
+        "duration_string":    meta.get("duration_string"),
+        "view_count":         meta.get("view_count"),
+        "like_count":         meta.get("like_count"),
+        "thumbnail":          meta.get("thumbnail"),
+        "description":        (meta.get("description") or "")[:500],
+        "upload_date":        meta.get("upload_date"),
+        "formats":            formats,
+        "subtitles":          subtitles,
         "automatic_captions": auto_subs,
-        "is_playlist":      is_playlist,
-        "playlist_count":   playlist_count,
-        "playlist_title":   meta.get("playlist_title") if is_playlist else None,
-        "webpage_url":      meta.get("webpage_url") or url,
-        "original_url":     url,
+        "webpage_url":        meta.get("webpage_url") or url,
+        "original_url":       url,
     }
 
-    logger.info(f"Info fetched: {meta.get('title')!r} | {len(formats)} formats")
+    logger.info(f"Info OK: {meta.get('title')!r} | {len(formats)} formats")
     return jsonify(response)
 
-# ─── Download ─────────────────────────────────────────────────────────────────
+# ─── API: Start Download ──────────────────────────────────────────────────────
 
 @app.route("/api/download/start", methods=["POST"])
 def start_download():
@@ -538,8 +532,9 @@ def start_download():
     if not is_valid_url(url):
         return jsonify({"error": "Invalid URL"}), 422
 
-    job_id = str(uuid.uuid4())
+    cleanup_old_files()
 
+    job_id = str(uuid.uuid4())
     with jobs_lock:
         jobs[job_id] = {
             "status":     "queued",
@@ -548,383 +543,24 @@ def start_download():
             "eta":        None,
             "filename":   None,
             "filesize":   None,
+            "filepath":   None,
             "error":      None,
             "url":        url,
             "created_at": time.time(),
         }
 
-    thread = threading.Thread(
+    t = threading.Thread(
         target=_download_worker,
         args=(job_id, url, data),
         daemon=True,
-        name=f"download-{job_id[:8]}",
+        name=f"dl-{job_id[:8]}",
     )
-    thread.start()
+    t.start()
 
-    logger.info(f"Download job {job_id[:8]} started for {url}")
+    logger.info(f"Job {job_id[:8]} queued: {url}")
     return jsonify({"job_id": job_id})
 
-
-# ─── Progress template untuk parsing akurat (seperti metube) ─────────────────
-# Template ini menghasilkan baris YTDLP_PROGRESS|...| yang mudah di-parse
-_PROGRESS_TMPL = (
-    "download:YTDLP_PROGRESS"
-    "|%(progress.downloaded_bytes)s"
-    "|%(progress.total_bytes)s"
-    "|%(progress.total_bytes_estimate)s"
-    "|%(progress.speed)s"
-    "|%(progress.eta)s"
-    "|%(progress._percent_str)s"
-)
-
-
-def _parse_progress_line(line: str) -> dict | None:
-    """
-    Parse baris YTDLP_PROGRESS dari yt-dlp progress-template.
-    Mengembalikan dict dengan key: progress, filesize, speed, eta
-    atau None jika bukan baris progress.
-    """
-    if not line.startswith("YTDLP_PROGRESS|"):
-        return None
-
-    parts = line.split("|")
-    # parts[0] = "YTDLP_PROGRESS"
-    # parts[1] = downloaded_bytes
-    # parts[2] = total_bytes
-    # parts[3] = total_bytes_estimate
-    # parts[4] = speed (bytes/s)
-    # parts[5] = eta (seconds)
-    # parts[6] = percent string (e.g. " 42.3%")
-
-    def safe_float(val):
-        try:
-            v = float(val)
-            return v if v > 0 else None
-        except (TypeError, ValueError):
-            return None
-
-    downloaded = safe_float(parts[1] if len(parts) > 1 else None)
-    total      = safe_float(parts[2] if len(parts) > 2 else None) or \
-                 safe_float(parts[3] if len(parts) > 3 else None)
-    speed_bps  = safe_float(parts[4] if len(parts) > 4 else None)
-    eta_secs   = safe_float(parts[5] if len(parts) > 5 else None)
-    pct_str    = parts[6].strip() if len(parts) > 6 else ""
-
-    # Hitung persen dari downloaded/total (akurat), fallback ke pct_str
-    pct = None
-    if downloaded is not None and total and total > 0:
-        pct = min(downloaded / total * 100, 100.0)
-    elif pct_str:
-        m = re.search(r"([\d.]+)%", pct_str)
-        if m:
-            pct = float(m.group(1))
-
-    return {
-        "progress": pct,
-        "filesize":  _format_bytes(total) if total else None,
-        "speed":     _format_speed(speed_bps),
-        "eta":       _format_eta(eta_secs),
-    }
-
-
-def _build_format_selector(audio_only: bool, audio_format: str,
-                            audio_quality: str, format_id: str,
-                            quality: str) -> list:
-    """
-    Bangun argumen -f / -x yang tepat untuk yt-dlp.
-    Referensi: metube dl_formats.py get_format()
-    """
-    # ── Audio only ────────────────────────────────────────────────────────────
-    if audio_only:
-        # Referensi metube dl_formats.py: f"bestaudio[ext={format}]/bestaudio/best"
-        # Coba stream native format dulu (jarang ada di YouTube), fallback ke
-        # bestaudio apapun lalu konversi via ffmpeg (-x --audio-format).
-        # bestaudio/best memastikan tidak pernah gagal "format not available".
-        _aq = audio_quality if audio_quality in ("0", "2", "5", "9") else "0"
-        _af = (audio_format or "mp3").lower()
-        format_sel = f"bestaudio[ext={_af}]/bestaudio/best"
-        return [
-            "-f", format_sel,
-            "-x",
-            "--audio-format", _af,
-            "--audio-quality", _aq,
-        ]
-
-    # ── Format_id eksplisit dari daftar format ────────────────────────────────
-    if format_id:
-        # Fallback chain: format+audio → format+apapun → format saja → best
-        # Matching metube: bestvideo+bestaudio/best pattern
-        return [
-            "-f",
-            f"{format_id}+bestaudio[ext=m4a]"
-            f"/{format_id}+bestaudio"
-            f"/{format_id}"
-            f"/bestvideo+bestaudio/best",
-        ]
-
-    # ── Quality preset (resolusi) ─────────────────────────────────────────────
-    if quality and quality not in ("best", "bestvideo+bestaudio", "bestvideo+bestaudio/best", ""):
-        # quality berupa height, misalnya "720", "1080"
-        # Coba dua kolom: mp4 stream dulu, lalu any
-        vres = f"[height<={quality}]"
-        return [
-            "-f",
-            f"bestvideo{vres}[ext=mp4]+bestaudio[ext=m4a]"
-            f"/bestvideo{vres}+bestaudio"
-            f"/best{vres}"
-            f"/bestvideo+bestaudio/best",
-        ]
-
-    # ── Default: kualitas terbaik ─────────────────────────────────────────────
-    return ["-f", "bestvideo+bestaudio/best"]
-
-
-def _download_worker(job_id: str, url: str, opts: dict):
-    """Background thread: runs yt-dlp and updates job state."""
-    cleanup_old_files()
-    cleanup_old_jobs()
-
-    audio_only     = opts.get("audio_only", False)
-    audio_format   = (opts.get("audio_format") or "mp3").lower()
-    # audio_quality: 0=best VBR, 2=high, 5=medium, 9=low (untuk lossy MP3/AAC/OGG/Opus)
-    # Untuk FLAC/WAV (lossless) nilai ini diabaikan yt-dlp (sudah lossless)
-    audio_quality  = str(opts.get("audio_quality") or "0").strip()
-    if audio_quality not in ("0", "2", "5", "9"):
-        audio_quality = "0"
-    format_id      = (opts.get("format_id") or "").strip()
-    quality        = (opts.get("quality") or "").strip()
-    # Container format untuk video: mp4/mkv/webm/avi/mov. Default mp4.
-    _VALID_CONTAINERS = {"mp4", "mkv", "webm", "avi", "mov"}
-    container      = (opts.get("container") or "mp4").lower().strip()
-    if container not in _VALID_CONTAINERS:
-        container = "mp4"
-    subtitles      = opts.get("subtitles", False)
-    subtitle_lang  = opts.get("subtitle_lang", "en")
-    auto_subs      = opts.get("auto_subtitles", False)
-    playlist       = opts.get("playlist", False)
-    playlist_start = opts.get("playlist_start")  # None = dari awal
-    playlist_end   = opts.get("playlist_end")    # None = sampai akhir
-    embed_thumb    = opts.get("embed_thumbnail", False)
-    embed_meta     = opts.get("embed_metadata", True)
-    write_subs     = opts.get("write_subtitles", False)
-    sub_format     = opts.get("subtitle_format", "srt")
-    cookies_from   = (opts.get("cookies_from_browser") or "").strip()
-    rate_limit     = opts.get("rate_limit")
-    user_proxy     = (opts.get("proxy") or "").strip()
-    embed_chapters = opts.get("embed_chapters", False)
-
-    output_template = str(DOWNLOAD_DIR / "%(title)s.%(ext)s")
-
-    args = [
-        url,
-        "--output", output_template,
-        "--no-warnings",
-        "--socket-timeout", "60",
-        "--retries", "5",
-        "--fragment-retries", "5",
-        "--extractor-retries", "3",
-        "--newline",
-        # Referensi metube: ignore_no_formats_error = True agar tidak crash
-        # saat format tertentu tidak tersedia di suatu video (e.g. age-restricted).
-        "--ignore-no-formats-error",
-        # Sama seperti /api/info: skip pengecekan HTTP per-format yang bisa gagal
-        # di beberapa video YouTube akibat geo-restriction atau token expiry.
-        "--no-check-formats",
-        # Gunakan progress-template untuk data numerik yang akurat (seperti metube)
-        "--progress-template", _PROGRESS_TMPL,
-    ]
-
-    # ── Format selection (diperbaiki) ─────────────────────────────────────────
-    args += _build_format_selector(audio_only, audio_format, audio_quality, format_id, quality)
-
-    # ── Playlist ──────────────────────────────────────────────────────────────
-    if not playlist:
-        args.append("--no-playlist")
-    else:
-        args += [
-            "--yes-playlist",
-            "--output",
-            str(DOWNLOAD_DIR / "%(playlist_title)s/%(playlist_index)s - %(title)s.%(ext)s"),
-        ]
-        # Playlist range: --playlist-start / --playlist-end
-        try:
-            if playlist_start and int(playlist_start) > 1:
-                args += ["--playlist-start", str(int(playlist_start))]
-        except (TypeError, ValueError):
-            pass
-        try:
-            if playlist_end and int(playlist_end) > 0:
-                args += ["--playlist-end", str(int(playlist_end))]
-        except (TypeError, ValueError):
-            pass
-
-    # ── Subtitles ─────────────────────────────────────────────────────────────
-    if subtitles:
-        args += ["--write-subs", "--sub-langs", subtitle_lang, "--sub-format", sub_format]
-    if auto_subs:
-        args += ["--write-auto-subs", "--sub-langs", subtitle_lang]
-    if write_subs:
-        args += ["--embed-subs"]
-
-    # ── Metadata / Thumbnail ──────────────────────────────────────────────────
-    if embed_thumb:
-        if audio_only:
-            # Referensi metube: FFmpegThumbnailsConvertor(format="jpg") + EmbedThumbnail.
-            # JANGAN pakai --write-thumbnail eksplisit — itu menyebabkan yt-dlp mencatat
-            # "[download] Destination: title.jpg" yang menimpa output_filename audio.
-            # --embed-thumbnail sudah handle thumbnail download+convert+embed secara
-            # internal tanpa mengubah Destination tracking ke file gambar.
-            args += ["--convert-thumbnails", "jpg", "--embed-thumbnail"]
-        else:
-            args.append("--embed-thumbnail")
-    if embed_meta:
-        args.append("--embed-metadata")
-    if embed_chapters and not audio_only:
-        args.append("--embed-chapters")
-
-    # ── Network & Cookies ─────────────────────────────────────────────────────
-    if rate_limit:
-        args += ["--rate-limit", str(rate_limit)]
-    if cookies_from:
-        args += ["--cookies-from-browser", cookies_from]
-
-    args += get_proxy_args(user_proxy)
-    args += get_cookies_args()
-
-    # ── Post-processing (video) ───────────────────────────────────────────────
-    if not audio_only:
-        # Gunakan container yang dipilih user (mp4/mkv/webm/avi/mov)
-        args += ["--merge-output-format", container, "--add-metadata"]
-
-    with jobs_lock:
-        jobs[job_id]["status"] = "downloading"
-
-    logger.info(f"Job {job_id[:8]} yt-dlp args: {' '.join(args)}")
-
-    # ── Run yt-dlp ────────────────────────────────────────────────────────────
-    try:
-        proc = subprocess.Popen(
-            ["yt-dlp"] + args,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-        )
-
-        output_filename = None
-        error_lines     = []
-
-        for raw_line in proc.stdout:
-            line = raw_line.strip()
-            if not line:
-                continue
-
-            # Kumpulkan baris error
-            if any(pfx in line for pfx in ("ERROR:", "WARNING:", "Error:")):
-                error_lines.append(line)
-
-            # ── Parse progress dari template (akurat, seperti metube) ──────
-            progress_data = _parse_progress_line(line)
-            if progress_data:
-                with jobs_lock:
-                    if progress_data["progress"] is not None:
-                        jobs[job_id]["progress"] = progress_data["progress"]
-                    if progress_data["filesize"]:
-                        jobs[job_id]["filesize"] = progress_data["filesize"]
-                    if progress_data["speed"]:
-                        jobs[job_id]["speed"]    = progress_data["speed"]
-                    if progress_data["eta"]:
-                        jobs[job_id]["eta"]      = progress_data["eta"]
-                continue  # Baris progress sudah di-handle
-
-            # ── Fallback: parse progress dari format lama yt-dlp ──────────
-            # (untuk kompatibilitas jika --progress-template tidak support)
-            if "[download]" in line and "%" in line:
-                m = re.search(
-                    r"([\d.]+)%"
-                    r"(?:\s+of\s+~?\s*([\d.]+\s*\S+))?"
-                    r"(?:\s+at\s+([\d.]+\s*\S+/s))?"
-                    r"(?:\s+ETA\s+(\S+))?",
-                    line,
-                )
-                if m:
-                    with jobs_lock:
-                        jobs[job_id]["progress"] = float(m.group(1))
-                        if m.group(2): jobs[job_id]["filesize"] = m.group(2).strip()
-                        if m.group(3): jobs[job_id]["speed"]    = m.group(3).strip()
-                        if m.group(4): jobs[job_id]["eta"]      = m.group(4).strip()
-
-            # ── Deteksi nama file output ───────────────────────────────────
-            # PENTING: jangan simpan file thumbnail (.jpg/.png/.webp) sebagai
-            # output utama — itu hanya file sementara yang di-embed lalu dihapus.
-            _IMAGE_EXTS = ('.jpg', '.jpeg', '.png', '.webp', '.jfif')
-
-            if "Destination:" in line:
-                dest = line.split("Destination:")[-1].strip()
-                if not dest.lower().endswith(_IMAGE_EXTS):
-                    output_filename = dest
-
-            if "[Merger]" in line and "Merging formats into" in line:
-                m = re.search(r'Merging formats into ["\'](.+?)["\']', line)
-                if m:
-                    output_filename = m.group(1).strip()
-
-            if "[ExtractAudio]" in line and "Destination:" in line:
-                output_filename = line.split("Destination:")[-1].strip()
-
-            if "has already been downloaded" in line:
-                m = re.search(r"\[download\]\s+(.+?)\s+has already been downloaded", line)
-                if m:
-                    candidate_name = m.group(1).strip()
-                    if not candidate_name.lower().endswith(_IMAGE_EXTS):
-                        output_filename = candidate_name
-
-            logger.debug(f"yt-dlp [{job_id[:8]}]: {line}")
-
-        proc.wait(timeout=600)
-
-        if proc.returncode == 0:
-            if not output_filename or not Path(output_filename).exists():
-                output_filename = str(_find_latest_file(hint_name=output_filename) or "")
-
-            with jobs_lock:
-                jobs[job_id]["status"]   = "completed"
-                jobs[job_id]["progress"] = 100
-                jobs[job_id]["filename"] = Path(output_filename).name if output_filename else None
-                jobs[job_id]["filepath"] = output_filename
-
-            logger.info(f"Job {job_id[:8]} completed: {output_filename}")
-        else:
-            candidate = _find_latest_file(hint_name=output_filename)
-            if candidate and candidate.stat().st_mtime > time.time() - 30:
-                logger.warning(f"Job {job_id[:8]} exited {proc.returncode} but file found: {candidate}")
-                with jobs_lock:
-                    jobs[job_id]["status"]   = "completed"
-                    jobs[job_id]["progress"] = 100
-                    jobs[job_id]["filename"] = candidate.name
-                    jobs[job_id]["filepath"] = str(candidate)
-            else:
-                err_msg = _extract_error_message("\n".join(error_lines)) if error_lines else "Download failed. Cek URL atau coba lagi."
-                with jobs_lock:
-                    jobs[job_id]["status"] = "error"
-                    jobs[job_id]["error"]  = err_msg
-                logger.warning(f"Job {job_id[:8]} failed (code {proc.returncode}): {err_msg}")
-
-    except subprocess.TimeoutExpired:
-        try: proc.kill()
-        except Exception: pass
-        with jobs_lock:
-            jobs[job_id]["status"] = "error"
-            jobs[job_id]["error"]  = "Download timed out."
-    except FileNotFoundError:
-        with jobs_lock:
-            jobs[job_id]["status"] = "error"
-            jobs[job_id]["error"]  = "yt-dlp is not installed on this server."
-    except Exception as e:
-        logger.exception(f"Unexpected error in job {job_id[:8]}")
-        with jobs_lock:
-            jobs[job_id]["status"] = "error"
-            jobs[job_id]["error"]  = str(e)
+# ─── API: Job Status ──────────────────────────────────────────────────────────
 
 @app.route("/api/download/status/<job_id>", methods=["GET"])
 def job_status(job_id: str):
@@ -935,15 +571,17 @@ def job_status(job_id: str):
         return jsonify({"error": "Job not found"}), 404
 
     return jsonify({
-        "job_id":    job_id,
-        "status":    job["status"],
-        "progress":  job["progress"],
-        "speed":     job["speed"],
-        "eta":       job["eta"],
-        "filename":  job["filename"],
-        "filesize":  job["filesize"],
-        "error":     job["error"],
+        "job_id":   job_id,
+        "status":   job["status"],
+        "progress": job["progress"],
+        "speed":    job["speed"],
+        "eta":      job["eta"],
+        "filename": job["filename"],
+        "filesize": job["filesize"],
+        "error":    job["error"],
     })
+
+# ─── API: Serve File ──────────────────────────────────────────────────────────
 
 @app.route("/api/download/file/<job_id>", methods=["GET"])
 def serve_file(job_id: str):
@@ -959,8 +597,13 @@ def serve_file(job_id: str):
     if not filepath or not Path(filepath).exists():
         return jsonify({"error": "File not found on server"}), 404
 
-    filename = Path(filepath).name
-    return send_file(filepath, as_attachment=True, download_name=sanitize_filename(filename))
+    return send_file(
+        filepath,
+        as_attachment=True,
+        download_name=sanitize_filename(Path(filepath).name),
+    )
+
+# ─── API: Cancel / Delete ────────────────────────────────────────────────────
 
 @app.route("/api/download/cancel/<job_id>", methods=["DELETE"])
 @app.route("/api/history/<job_id>", methods=["DELETE"])
@@ -989,7 +632,7 @@ def not_found(e):
     index_path = BASE_DIR / "index.html"
     if index_path.exists():
         return send_from_directory(str(BASE_DIR), "index.html")
-    return jsonify({"error": "Endpoint not found", "base_dir": str(BASE_DIR)}), 404
+    return jsonify({"error": "Not found"}), 404
 
 @app.errorhandler(405)
 def method_not_allowed(e):
@@ -1001,16 +644,14 @@ def internal_error(e):
     return jsonify({"error": "Internal server error"}), 500
 
 # ─── Entry Point ──────────────────────────────────────────────────────────────
+
 if __name__ == "__main__":
     port  = int(os.environ.get("PORT", 5000))
     debug = os.environ.get("DEBUG", "false").lower() == "true"
 
-    logger.info(f"🌙 LunarMediaDL Server starting on port {port}")
-    logger.info(f"📂 BASE_DIR: {BASE_DIR}")
-    logger.info(f"📂 Download directory: {DOWNLOAD_DIR}")
-    logger.info(f"📄 index.html found: {(BASE_DIR / 'index.html').exists()}")
-    logger.info(f"🌐 Proxy: {DEFAULT_PROXY or 'none (direct connection)'}")
-
-    _auto_load_cookies()
+    logger.info(f"🌙 LunarMediaDL (Merged) starting on port {port}")
+    logger.info(f"📂 BASE_DIR:     {BASE_DIR}")
+    logger.info(f"📂 Download dir: {DOWNLOAD_DIR}")
+    logger.info(f"🍪 Cookies:      {COOKIES_FILE.exists() and COOKIES_FILE.stat().st_size > 0}")
 
     app.run(host="0.0.0.0", port=port, debug=debug, threaded=True)
