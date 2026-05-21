@@ -627,16 +627,17 @@ def _build_format_selector(audio_only: bool, audio_format: str,
     """
     # ── Audio only ────────────────────────────────────────────────────────────
     if audio_only:
-        # Pilih stream audio terbaik, lalu konversi ke format yang diminta.
-        # Mirip metube: bestaudio/best agar tidak gagal "format not available".
-        # -x = extract audio; --audio-format = target codec via ffmpeg.
-        # audio_quality: 0=best VBR (default), 2=high, 5=medium, 9=low
-        # Untuk FLAC/WAV (lossless), --audio-quality tidak berpengaruh.
+        # Referensi metube dl_formats.py: f"bestaudio[ext={format}]/bestaudio/best"
+        # Coba stream native format dulu (jarang ada di YouTube), fallback ke
+        # bestaudio apapun lalu konversi via ffmpeg (-x --audio-format).
+        # bestaudio/best memastikan tidak pernah gagal "format not available".
         _aq = audio_quality if audio_quality in ("0", "2", "5", "9") else "0"
+        _af = (audio_format or "mp3").lower()
+        format_sel = f"bestaudio[ext={_af}]/bestaudio/best"
         return [
-            "-f", "bestaudio/best",
+            "-f", format_sel,
             "-x",
-            "--audio-format", (audio_format or "mp3").lower(),
+            "--audio-format", _af,
             "--audio-quality", _aq,
         ]
 
@@ -714,6 +715,12 @@ def _download_worker(job_id: str, url: str, opts: dict):
         "--fragment-retries", "5",
         "--extractor-retries", "3",
         "--newline",
+        # Referensi metube: ignore_no_formats_error = True agar tidak crash
+        # saat format tertentu tidak tersedia di suatu video (e.g. age-restricted).
+        "--ignore-no-formats-error",
+        # Sama seperti /api/info: skip pengecekan HTTP per-format yang bisa gagal
+        # di beberapa video YouTube akibat geo-restriction atau token expiry.
+        "--no-check-formats",
         # Gunakan progress-template untuk data numerik yang akurat (seperti metube)
         "--progress-template", _PROGRESS_TMPL,
     ]
@@ -752,7 +759,13 @@ def _download_worker(job_id: str, url: str, opts: dict):
 
     # ── Metadata / Thumbnail ──────────────────────────────────────────────────
     if embed_thumb:
-        args.append("--embed-thumbnail")
+        if audio_only:
+            # Referensi metube: FFmpegThumbnailsConvertor(format="jpg", when="before_dl")
+            # lalu EmbedThumbnail. Tanpa konversi ke JPG dulu, embed bisa gagal
+            # untuk format thumbnail non-JPEG (webp dll) yang umum di YouTube.
+            args += ["--write-thumbnail", "--convert-thumbnails", "jpg", "--embed-thumbnail"]
+        else:
+            args.append("--embed-thumbnail")
     if embed_meta:
         args.append("--embed-metadata")
     if embed_chapters and not audio_only:
