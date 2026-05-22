@@ -1,0 +1,14 @@
+# nixpacks.toml — Railway build configuration
+# nodejs is REQUIRED for yt-dlp YouTube signature/n-challenge solving
+
+[phases.setup]
+nixPkgs = ["python311", "ffmpeg", "nodejs_20", "nodePackages.npm"]
+
+[phases.install]
+cmds = [
+    "pip install --upgrade pip",
+    "pip install .",
+]
+
+[start]
+cmd = "python app/main.py"

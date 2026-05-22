@@ -1,0 +1,22 @@
+[project]
+name = "lunarmediadl"
+version = "1.0.0"
+description = "LunarMediaDL — Universal media downloader frontend on MeTube engine"
+requires-python = ">=3.11"
+dependencies = [
+    "aiohttp>=3.9",
+    "python-socketio>=5.0,<6.0",
+    # curl-cffi: better TLS fingerprinting for bypassing bot detection
+    # deno extra: fallback JS runtime for YouTube signature solving
+    # (Node.js in container is the primary solver; this is secondary fallback)
+    "yt-dlp[default,curl-cffi]",
+    "mutagen",
+    "watchfiles",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
