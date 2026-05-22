@@ -1,0 +1,20 @@
+[project]
+name = "lunarmediadl"
+version = "1.0.0"
+description = "LunarMediaDL — Universal media downloader frontend on MeTube engine"
+requires-python = ">=3.11"
+dependencies = [
+    "aiohttp>=3.9",
+    "aiohttp-cors",
+    "python-socketio>=5.0,<6.0",
+    "yt-dlp[default]",
+    "mutagen",
+    "watchfiles",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
